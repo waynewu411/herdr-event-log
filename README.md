@@ -20,18 +20,27 @@ log always has a full history you can resume from at any offset.
 
 ## Install
 
+The hook is a Go binary, built from `main.go`. The binary itself is **not
+committed** — it's platform-specific and would silently go stale relative to
+its source if it were checked in, so it's always built fresh from source
+instead. `.gitignore` excludes it.
+
 From this repo's checkout:
 
 ```bash
 herdr plugin link <path-to-this-repo>
+make build
 herdr plugin enable waynewu411.herdr-event-log
 ```
 
 `link` registers the plugin manifest (`herdr-plugin.toml`) with the current
 Herdr session; `enable` turns it on. Both are per Herdr session/socket — run
-them again for any other session instance you want covered.
+them again for any other session instance you want covered. `make build`
+must be re-run after pulling any change to `main.go` — `herdr-plugin.toml`
+points at the built `./hook` binary, not the Go source, so a stale binary
+silently keeps running old behavior otherwise.
 
-Once enabled, Herdr invokes `hook.mjs` automatically on every
+Once enabled, Herdr invokes `./hook` automatically on every
 `pane.agent_status_changed` event, for the life of that session. There is
 nothing to start, supervise, or restart.
 
@@ -81,6 +90,25 @@ This is the same byte-offset cursor approach used by
 [`joelhooks/herdr-pings`](https://github.com/joelhooks/herdr-pings), arrived
 at independently — a sign it's the right pattern for this problem, not a
 novel risk.
+
+## Development
+
+```bash
+make build   # build the hook binary (go build -o hook .)
+make test    # unit tests + the automated cursor-resume test (go test -race ./...)
+make vet     # go vet ./...
+make fmt     # checks gofmt compliance; run `gofmt -w .` yourself to fix
+make clean   # remove the built binary
+```
+
+`make test` covers the hook's own logic (well-formed events, graceful
+failure on missing/malformed `HERDR_PLUGIN_EVENT_JSON` or a missing
+`HERDR_PLUGIN_STATE_DIR`) and, separately, the cursor-resume recipe above —
+it synthesizes a log file, simulates a gap, and asserts the exact
+`tail`/`grep` recipe documented here catches everything across it. Neither
+requires a live Herdr session. A GitHub Actions workflow
+(`.github/workflows/test.yml`) runs `make fmt`, `make vet`, `make build`, and
+`make test` on every pull request and on push to `main`.
 
 ## Non-goal: active push
 

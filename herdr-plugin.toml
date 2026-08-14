@@ -5,4 +5,4 @@ min_herdr_version = "0.7.0"
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["node", "hook.mjs"]
+command = ["./hook"]
