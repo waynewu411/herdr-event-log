@@ -44,9 +44,40 @@ Once enabled, Herdr invokes `./hook` automatically on every
 `pane.agent_status_changed` event, for the life of that session. There is
 nothing to start, supervise, or restart.
 
+## Log file: one per Herdr instance
+
+The hook writes to a log file scoped to the specific Herdr session/socket it
+was invoked for, not a single fixed `events.log` shared by every session on
+the machine:
+
+```
+$HERDR_PLUGIN_STATE_DIR/events-<hash>.log
+```
+
+`<hash>` is derived from `$HERDR_SOCKET_PATH`: **SHA-256 of the socket path
+string, hex-encoded, truncated to the first 16 characters of the digest.**
+That's the whole algorithm — no coordination or registration needed to
+compute it. Any reader that also has `$HERDR_SOCKET_PATH` set (i.e. is
+itself running inside the same Herdr session) can derive the exact same
+filename independently:
+
+```bash
+LOG_HASH=$(printf '%s' "$HERDR_SOCKET_PATH" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)
+LOGFILE="$HERDR_PLUGIN_STATE_DIR/events-${LOG_HASH}.log"
+```
+
+(`sha256sum` is used when available — typical on Linux — falling back to
+`shasum -a 256`, typical on macOS; both print the hex digest first, so
+`cut -c1-16` takes the same 16 characters either way.)
+
+`$HERDR_SOCKET_PATH` is what identifies the running Herdr instance for this
+purpose — it has a stable 1:1 correspondence with the session. (This is
+unrelated to `herdr-client.sock`, a separate terminal-rendering-protocol
+socket that has nothing to do with plugin state.)
+
 ## Log format
 
-One JSON object per line, appended to `$HERDR_PLUGIN_STATE_DIR/events.log`:
+One JSON object per line, appended to the per-instance log file above:
 
 ```json
 {"ts":"2026-08-14T02:13:04.512Z","pane_id":"w3:p2","agent_status":"idle","workspace_id":"w3","agent":"tester"}
@@ -73,13 +104,17 @@ persisted byte-offset cursor and never miss an event, even across an
 arbitrarily long gap where it isn't tailing at all:
 
 ```bash
+# derive the per-instance log filename (see "Log file" above)
+LOG_HASH=$(printf '%s' "$HERDR_SOCKET_PATH" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)
+LOGFILE="$HERDR_PLUGIN_STATE_DIR/events-${LOG_HASH}.log"
+
 # snapshot cursor BEFORE you start caring about a pane_id (avoids a race)
-CURSOR=$(wc -c < "$HERDR_PLUGIN_STATE_DIR/events.log")
+CURSOR=$(wc -c < "$LOGFILE")
 # wait: tail from the cursor, grep for what you care about, exits on first match
-tail -c +$((CURSOR+1)) -f "$HERDR_PLUGIN_STATE_DIR/events.log" | grep --line-buffered -m1 '"pane_id":"<target>"'
+tail -c +$((CURSOR+1)) -f "$LOGFILE" | grep --line-buffered -m1 '"pane_id":"<target>"'
 # after the wait returns (or if you go off and do something else entirely first),
 # re-snapshot before your next wait so you never lose anything in between
-CURSOR=$(wc -c < "$HERDR_PLUGIN_STATE_DIR/events.log")
+CURSOR=$(wc -c < "$LOGFILE")
 ```
 
 Chain a second `grep` if you also need to match on `agent_status`. Snapshot
@@ -101,12 +136,21 @@ make fmt     # checks gofmt compliance; run `gofmt -w .` yourself to fix
 make clean   # remove the built binary
 ```
 
-`make test` covers the hook's own logic (well-formed events, graceful
-failure on missing/malformed `HERDR_PLUGIN_EVENT_JSON` or a missing
-`HERDR_PLUGIN_STATE_DIR`) and, separately, the cursor-resume recipe above —
-it synthesizes a log file, simulates a gap, and asserts the exact
-`tail`/`grep` recipe documented here catches everything across it. Neither
-requires a live Herdr session. A GitHub Actions workflow
+`make test` covers:
+
+- the hook's own logic (well-formed events, the log-filename hash
+  derivation, graceful failure on missing/malformed
+  `HERDR_PLUGIN_EVENT_JSON`, a missing `HERDR_PLUGIN_STATE_DIR`, or a
+  missing `HERDR_SOCKET_PATH`);
+- the cursor-resume recipe above — synthesizes a log file, simulates a gap,
+  and asserts the exact `tail`/`grep` recipe documented here catches
+  everything across it;
+- the `O_APPEND` + single-`write()` atomicity assumption the design relies
+  on — spawns many real child OS processes (not goroutines) that all
+  invoke the built hook binary concurrently against the same log file, then
+  asserts every line is present, valid JSON, and not merged/truncated.
+
+None of this requires a live Herdr session. A GitHub Actions workflow
 (`.github/workflows/test.yml`) runs `make fmt`, `make vet`, `make build`, and
 `make test` on every pull request and on push to `main`.
 

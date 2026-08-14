@@ -15,6 +15,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,8 +27,22 @@ import (
 const (
 	stateDirEnv = "HERDR_PLUGIN_STATE_DIR"
 	eventEnv    = "HERDR_PLUGIN_EVENT_JSON"
-	logFileName = "events.log"
+	socketEnv   = "HERDR_SOCKET_PATH"
+
+	logFilePrefix  = "events-"
+	logFileSuffix  = ".log"
+	logFileHashLen = 16
 )
+
+// logFileName derives the per-Herdr-instance log filename from
+// $HERDR_SOCKET_PATH: sha256(socketPath), hex-encoded, truncated to the
+// first 16 characters of the digest. See README for the exact algorithm —
+// a reader with its own $HERDR_SOCKET_PATH can independently derive the
+// same filename with no coordination.
+func logFileName(socketPath string) string {
+	sum := sha256.Sum256([]byte(socketPath))
+	return logFilePrefix + hex.EncodeToString(sum[:])[:logFileHashLen] + logFileSuffix
+}
 
 // logLine is the shape of one appended log line. PaneID/AgentStatus/
 // WorkspaceID are omitted entirely when absent from the event payload
@@ -71,13 +87,16 @@ func buildLine(raw string, now time.Time) ([]byte, error) {
 
 // run performs the whole hook: validate env, build the log line, append it.
 // It writes nothing unless the line was built successfully, so a failure
-// never leaves a partial or corrupt line in events.log.
-func run(stateDir, raw string, now time.Time) error {
+// never leaves a partial or corrupt line in the log file.
+func run(stateDir, raw, socketPath string, now time.Time) error {
 	if stateDir == "" {
 		return fmt.Errorf("%s is not set — refusing to write anywhere else", stateDirEnv)
 	}
 	if raw == "" {
 		return fmt.Errorf("%s is not set", eventEnv)
+	}
+	if socketPath == "" {
+		return fmt.Errorf("%s is not set — refusing to derive a log filename", socketEnv)
 	}
 
 	line, err := buildLine(raw, now)
@@ -85,20 +104,21 @@ func run(stateDir, raw string, now time.Time) error {
 		return err
 	}
 
-	f, err := os.OpenFile(filepath.Join(stateDir, logFileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fileName := logFileName(socketPath)
+	f, err := os.OpenFile(filepath.Join(stateDir, fileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", logFileName, err)
+		return fmt.Errorf("failed to open %s: %w", fileName, err)
 	}
 	defer f.Close()
 
 	if _, err := f.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("failed to write %s: %w", logFileName, err)
+		return fmt.Errorf("failed to write %s: %w", fileName, err)
 	}
 	return nil
 }
 
 func main() {
-	if err := run(os.Getenv(stateDirEnv), os.Getenv(eventEnv), time.Now()); err != nil {
+	if err := run(os.Getenv(stateDirEnv), os.Getenv(eventEnv), os.Getenv(socketEnv), time.Now()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

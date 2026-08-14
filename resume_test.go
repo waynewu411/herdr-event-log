@@ -116,7 +116,9 @@ func TestCursorResumeRecipe_CatchesEventsAcrossAGap(t *testing.T) {
 	requireUnixTools(t)
 
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "events.log")
+	// Uses the same hash-derived filename a real reader would compute from
+	// its own $HERDR_SOCKET_PATH — see logFileName in main.go and README.
+	logPath := filepath.Join(dir, logFileName(testSocketPath))
 
 	// Pre-existing history for an unrelated pane, as if the log already
 	// had activity before we ever started caring about w2:p9.
