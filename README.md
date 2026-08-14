@@ -44,6 +44,46 @@ Once enabled, Herdr invokes `./hook` automatically on every
 `pane.agent_status_changed` event, for the life of that session. There is
 nothing to start, supervise, or restart.
 
+## Plugin manifest
+
+This repo's current `herdr-plugin.toml`, verbatim:
+
+```toml
+id = "waynewu411.herdr-event-log"
+name = "Herdr Event Log"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./hook"]
+```
+
+`[[events]]` is TOML's array-of-tables syntax — each `[[events]]` block is
+one hook registration, and `on` inside it is a single string, not an array
+(verified against
+[`RawPluginManifestEventHook`](https://github.com/herdrdev/herdr/blob/main/src/app/api/plugins/manifest.rs#L64-L69)
+in Herdr's own source: `on: String`, not `Vec<String>`). The array-ness
+lives entirely in the outer `[[events]]` repetition, not in `on` itself.
+
+If this plugin ever grows to log more than `pane.agent_status_changed` (see
+[Why](#why) — the manifest is deliberately scoped broadly for exactly this
+reason), that means **another `[[events]]` block**, not a list value on
+`on`:
+
+```toml
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./hook"]
+
+[[events]]
+on = "some.other_event_type"
+command = ["./hook"]
+```
+
+Not `on = ["pane.agent_status_changed", "some.other_event_type"]` — that
+shape doesn't exist in the manifest schema.
+
 ## Log file: one per Herdr instance
 
 The hook writes to a log file scoped to the specific Herdr session/socket it
