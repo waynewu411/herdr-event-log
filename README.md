@@ -166,6 +166,46 @@ This is the same byte-offset cursor approach used by
 at independently — a sign it's the right pattern for this problem, not a
 novel risk.
 
+## Bundled wait helper: `scripts/herdr-ewait.sh`
+
+This repo also ships `scripts/herdr-ewait.sh`, a hardened event-log consumer
+for orchestration code. It replaces hand-rolled `tail -f`/`sleep` loops with a
+cursor-based bounded reader plus live `herdr agent get` verification:
+
+```bash
+scripts/herdr-ewait.sh \
+  --targets "w3:p2,w4:p1" \
+  --states "blocked|done|idle" \
+  --log "$LOGFILE" \
+  --cursor-file "/tmp/herdr-ewait.cursor" \
+  --overall-timeout 3600 \
+  --poll 5 \
+  --safety-net 60
+```
+
+- `--targets` is a comma-separated list of `pane_id`s to watch.
+- `--states` is a `|`-separated regex of statuses to accept; the default is
+  `blocked|done|idle`.
+- `--log` is the per-instance event log described above.
+- `--cursor-file` persists the byte cursor across calls.
+- `--overall-timeout`, `--poll`, and `--safety-net` tune the total wait, the
+  bounded read interval, and the periodic verification sweep.
+
+On success stdout is exactly one compact JSON line:
+
+```json
+{"pane_id":"w3:p2","verified_state":"done","ts":"2026-08-15T00:00:00Z"}
+```
+
+Exit codes are `0` for a verified hit, `2` for overall timeout, `3` when the
+log is missing/unreadable at start (the caller can fall back to the degraded
+`herdr agent wait` path), and `4` for a usage error.
+
+Log matches are wake-up signals, not truth: every candidate hit and every
+periodic safety-net sweep is re-checked against `herdr agent get`, so a stale
+log line cannot produce a false success. A fresh invocation starts its cursor
+at the current log size, so it never replays old history.
+
 ## Development
 
 ```bash
