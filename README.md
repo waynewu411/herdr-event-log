@@ -166,7 +166,7 @@ This is the same byte-offset cursor approach used by
 at independently — a sign it's the right pattern for this problem, not a
 novel risk.
 
-## Ready-made waiter: `scripts/herdr-ewait.sh`
+## Bundled wait helper: `scripts/herdr-ewait.sh`
 
 This repo also ships `scripts/herdr-ewait.sh`, a hardened event-log consumer
 for orchestration code. It replaces hand-rolled `tail -f`/`sleep` loops with a
@@ -203,8 +203,8 @@ log is missing/unreadable at start (the caller can fall back to the degraded
 
 Log matches are wake-up signals, not truth: every candidate hit and every
 periodic safety-net sweep is re-checked against `herdr agent get`, so a stale
-log line cannot produce a false success. A fresh waiter starts its cursor at
-the current log size, so it never replays old history.
+log line cannot produce a false success. A fresh invocation starts its cursor
+at the current log size, so it never replays old history.
 
 ## Development
 
