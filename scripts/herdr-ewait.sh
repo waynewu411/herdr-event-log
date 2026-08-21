@@ -8,10 +8,16 @@
 # Usage:
 #   herdr-ewait.sh --targets "id1,id2" [--states "blocked|done|idle"] \
 #                   --log <file> --cursor-file <file> \
-#                   [--overall-timeout 3600] [--poll 5] [--safety-net 60]
+#                   [--overall-timeout 3600] [--poll 5] [--safety-net 60] \
+#                   [--stall-after 0]
 #
-# Stdout on success: exactly one compact JSON line, nothing else:
+# Stdout on success (exit 0): exactly one compact JSON line, nothing else:
 #   {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>"}
+# Stdout on a suspected stall (exit 5): one compact JSON line, nothing else:
+#   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","ts":"<ISO8601 UTC>"}
+# Stdout on a target unreachable for a full --stall-after window (exit 5): detection_content_seq
+# is JSON null and agent_status is omitted, since neither could be read:
+#   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":null,"ts":"<ISO8601 UTC>"}
 #
 # Exit codes:
 #   0  hit — a target reached one of --states, verified by `herdr agent get`
@@ -19,11 +25,53 @@
 #   3  log file missing/unreadable at start (caller should fall back to the
 #      degraded `herdr agent wait` path — see references/supervision.md)
 #   4  usage error
+#   5  suspected stall (only possible when --stall-after > 0; see rule 6 below), one of:
+#        - a target's `detection_content_seq` has not moved across two bracketing
+#          `--stall-after` checks (so at least one full window, confirmed by TWO
+#          observations, not one ambiguous sample — a probe-miss or no-seq-field tick in
+#          between does NOT reset the bracket, by design; see rule 6) while its live
+#          `agent_status` is verified still `working` at both
+#        - a target's probe (`herdr agent get`) has failed for a full `--stall-after`
+#          window — the pane may no longer exist
+#      Either way the caller does not keep waiting silently and does not skip-level
+#      inspect the target itself — it raises a REQUEST (`type: worker-stall`) to its own
+#      direct parent with this evidence. If the target is reachable but its `herdr agent
+#      get` responses carry no `detection_content_seq` field at all, the working-stall
+#      check is a no-op for those ticks — a one-time warning is printed to stderr, and the
+#      run relies on `--overall-timeout` unless/until the field starts appearing.
+#      NOTE — worst-case detection latency: because a working-stall verdict needs TWO
+#      bracketing checks, and a stall that begins mid-wait first consumes one window
+#      re-baselining against the last real content change (that tick observes a MOVED
+#      seq, so it can't itself start the bracket), the worst case is roughly 3x
+#      `--stall-after` (~2x for a target already stalled when the wait starts). Size
+#      `--stall-after` well under a THIRD of `--overall-timeout` accordingly (the shipped
+#      default, 600s vs. a 3600s timeout, has ~6x headroom).
 #
 # Five hardening rules (each numbered comment below fixes a live #820 bug):
 #   1. check-first        4. verify-on-hit
 #   2. bounded poll, never `tail -f`   5. periodic safety net
 #   3. non-configurable default state filter
+#
+# Rule 6 — optional stall detection (#841, opt-in via --stall-after, default 0/disabled):
+#   Rules 1-5 above only ever react to a `blocked|done|idle` *transition* — #823's
+#   "27-minute silent stall" was healed as a missed transition event, but `working` itself
+#   still carries no progress signal, so nothing before this rule can tell "still working,
+#   legitimately slow" from "still working, silently stuck". Rule 6 closes that gap with a
+#   cheap, cooperation-free liveness probe: `detection_content_seq` (already returned by
+#   every `herdr agent get`, and parsed from the SAME response as `agent_status` — one
+#   capture per target per tick, never two separate probes) increments whenever a pane's
+#   rendered content changes, independent of the target agent choosing to self-report
+#   anything. The last known-good value is retained across probe outages and across ticks
+#   where the target is reachable but not `working` (so a flapping probe, or time
+#   legitimately spent `blocked`, never manufactures a false verdict or hides a real one),
+#   and firing requires TWO bracketing unchanged+`working` observations, not one — closing
+#   the single-sample ambiguity a pane can hit right after a legitimate blocked spell. A
+#   probe-miss or no-seq-field tick between the two does NOT reset the bracket (deliberately
+#   — otherwise a flapping probe could permanently suppress a real verdict), so "two
+#   bracketing observations" is not always "two back-to-back ticks".
+#   Comparing across a `--stall-after` window lets the target's *direct parent* — the only
+#   party allowed to look at it at all — detect a real stall without a skip-level `pane
+#   read` of a grandchild, and without waiting out the full `--overall-timeout` to find out.
 
 set -euo pipefail
 
@@ -34,9 +82,10 @@ CURSOR_FILE=""
 OVERALL_TIMEOUT=3600
 POLL=5
 SAFETY_NET=60
+STALL_AFTER=0   # rule 6: opt-in; 0 = disabled, fully backward compatible
 
 usage() {
-  echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N]" >&2
+  echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N] [--stall-after N]" >&2
   exit 4
 }
 
@@ -49,6 +98,7 @@ while [ $# -gt 0 ]; do
     --overall-timeout) OVERALL_TIMEOUT="$2"; shift 2 ;;
     --poll) POLL="$2"; shift 2 ;;
     --safety-net) SAFETY_NET="$2"; shift 2 ;;
+    --stall-after) STALL_AFTER="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -56,6 +106,14 @@ done
 [ -n "$TARGETS" ] || usage
 [ -n "$LOG" ] || usage
 [ -n "$CURSOR_FILE" ] || usage
+# rule 6: reject a non-numeric/negative/overlong --stall-after loudly (usage error) rather
+# than silently disabling the stall-detection the caller explicitly asked for. The length
+# cap matters as much as the digits-only check: past ~19 digits `[ "$STALL_AFTER" -gt 0 ]`
+# itself errors ("integer expression expected") and every call site swallows that via
+# `2>/dev/null`, which would otherwise silently disable rule 6 for the whole run exactly
+# like the non-numeric case this guard exists to catch.
+case "$STALL_AFTER" in ''|*[!0-9]*) usage ;; esac
+[ "${#STALL_AFTER}" -le 9 ] || usage
 
 # --- log availability check (exit 3 = caller falls back to the degraded path) ---
 if [ ! -r "$LOG" ]; then
@@ -80,6 +138,28 @@ get_status() {
     | grep -o '"agent_status":"[^"]*"' \
     | head -n1 \
     | sed -E 's/"agent_status":"([^"]*)"/\1/'
+}
+
+# Rule 6: parse agent_status / detection_content_seq out of an ALREADY-CAPTURED `herdr agent
+# get <id>` response (never make a second live call) — the stall sweep below captures one
+# response per target per tick and parses both fields from that single capture, so there is
+# no window between two separate probes in which the pane's real state could change and be
+# read inconsistently. detection_content_seq is an unquoted integer that increments whenever
+# the pane's rendered content changes, independent of agent_status. Empty on a probe miss OR
+# on a response that has no detection_content_seq field at all — the two are disambiguated by
+# whether agent_status can still be parsed from the same response (see the stall sweep below).
+parse_agent_status() {
+  printf '%s' "$1" \
+    | grep -o '"agent_status":"[^"]*"' \
+    | head -n1 \
+    | sed -E 's/"agent_status":"([^"]*)"/\1/'
+}
+
+parse_content_seq() {
+  printf '%s' "$1" \
+    | grep -o '"detection_content_seq":[0-9]*' \
+    | head -n1 \
+    | sed -E 's/"detection_content_seq":([0-9]*)/\1/'
 }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -128,6 +208,34 @@ fi
 
 START_TS=$(date +%s)
 LAST_SAFETY_NET=$START_TS
+LAST_STALL_CHECK=$START_TS
+
+# Rule 6 setup: establish a baseline detection_content_seq per target so the first
+# stall-check tick has something to compare against. Skipped entirely when --stall-after is
+# 0 (the default) — zero extra `agent get` calls for every existing caller.
+# STALL_SEQ_ARR/STALL_TS_ARR track the last known-good seq and how long it's held; a
+# separate STALL_MISS_SINCE_ARR tracks a genuine probe outage (no response at all) — kept
+# apart so a flapping probe never loses the seq baseline it had before the flap (see the
+# stall sweep below for why that matters). STALL_PREV_WORKING_ARR requires two bracketing
+# unchanged+working observations before a stall may fire (an intervening probe-miss/no-seq
+# tick does not reset it), so a single ambiguous sample (e.g. a pane observed working right
+# after it stopped being legitimately blocked) can't fire on its own — see the stall sweep
+# below.
+if [ "$STALL_AFTER" -gt 0 ] 2>/dev/null; then
+  for i in "${!TARGET_ARR[@]}"; do
+    # F4: `|| true` on every parse below — a probe failure is a top-level command
+    # substitution under `set -euo pipefail`; without the guard, one bad `herdr agent get`
+    # would kill the whole script.
+    RESP="$(herdr agent get "${TARGET_ARR[$i]}" 2>/dev/null || true)"
+    STALL_SEQ_ARR[$i]="$(parse_content_seq "$RESP" || true)"
+    STALL_TS_ARR[$i]=$START_TS
+    STALL_MISS_SINCE_ARR[$i]=""
+    STALL_PREV_WORKING_ARR[$i]=""
+    if [ -z "${STALL_SEQ_ARR[$i]}" ] && [ -z "$(parse_agent_status "$RESP" || true)" ]; then
+      STALL_MISS_SINCE_ARR[$i]=$START_TS
+    fi
+  done
+fi
 
 while :; do
   NOW_TS=$(date +%s)
@@ -180,6 +288,102 @@ while :; do
       if verify_and_maybe_emit "$t"; then
         exit 0
       fi
+    done
+  fi
+
+  # Rule 6 (optional, opt-in): stall detection. Every --stall-after seconds, compare each
+  # target's detection_content_seq against the value recorded at the previous check. No
+  # movement across a full window, while the target is verified still `working`, is a
+  # suspected stall (exit 5) — the caller escalates via REQUEST rather than waiting out
+  # --overall-timeout. A target whose probe itself fails for a full window (pane gone,
+  # herdr socket down) is reported the same way, with detection_content_seq:null, so a
+  # persistently unreachable target isn't silently waited out for --overall-timeout either.
+  if [ "$STALL_AFTER" -gt 0 ] 2>/dev/null && [ $(( NOW_TS - LAST_STALL_CHECK )) -ge "$STALL_AFTER" ]; then
+    LAST_STALL_CHECK="$NOW_TS"
+    for i in "${!TARGET_ARR[@]}"; do
+      t="${TARGET_ARR[$i]}"
+      # F4/F5: ONE `herdr agent get` capture per target per tick — both seq and status are
+      # parsed from the SAME response (see the setup loop above), so there is no window
+      # between two separate probes in which the pane's real state could change and be read
+      # inconsistently. `|| true` is required — see the setup loop above.
+      RESP="$(herdr agent get "$t" 2>/dev/null || true)"
+      seq="$(parse_content_seq "$RESP" || true)"
+
+      if [ -z "$seq" ]; then
+        # No detection_content_seq in the response — could mean the probe failed, or the
+        # target is reachable but this herdr build's response just lacks the field. Only
+        # the former is evidence of a stall, and only the former may claim the pane "may no
+        # longer exist"; check agent_status from the SAME response to tell them apart.
+        status="$(parse_agent_status "$RESP" || true)"
+        if [ -n "$status" ]; then
+          # Reachable — this herdr build/response just has no detection_content_seq field,
+          # so the working-stall check is a no-op for THIS tick (not a run-level disable —
+          # if the field starts appearing later, detection resumes normally). Not evidence
+          # of a stall either way; warn once so --stall-after isn't silently a no-op.
+          STALL_MISS_SINCE_ARR[$i]=""
+          if [ -z "${STALL_NO_SEQ_WARNED:-}" ]; then
+            echo "herdr-ewait: --stall-after is set but a 'herdr agent get' response carried no detection_content_seq field — the working-stall check is a no-op for such ticks until the field appears" >&2
+            STALL_NO_SEQ_WARNED=1
+          fi
+          continue
+        fi
+        miss_since="${STALL_MISS_SINCE_ARR[$i]:-}"
+        if [ -z "$miss_since" ]; then
+          # First tick of a genuine outage — start timing it; don't report yet.
+          STALL_MISS_SINCE_ARR[$i]="$NOW_TS"
+        elif [ $(( NOW_TS - miss_since )) -ge "$STALL_AFTER" ]; then
+          # Unreachable for a full window — report rather than silently waiting out
+          # --overall-timeout for a target that may no longer exist.
+          printf '{"pane_id":"%s","suspected_stall_s":%s,"detection_content_seq":null,"ts":"%s"}\n' \
+            "$t" "$(( NOW_TS - miss_since ))" "$(now_iso)"
+          exit 5
+        fi
+        continue
+      fi
+
+      # Probe succeeded — the target is reachable, so any prior outage is over. Note this
+      # never clears STALL_SEQ_ARR/STALL_TS_ARR: a probe that flaps (fails, then recovers to
+      # the SAME seq it had before the flap) must still be recognised as "unchanged since the
+      # original baseline", not reset to a fresh one — otherwise a genuinely stalled worker
+      # behind an intermittently failing socket would never trip rule 6.
+      STALL_MISS_SINCE_ARR[$i]=""
+
+      prev="${STALL_SEQ_ARR[$i]:-}"
+      if [ -n "$prev" ] && [ "$seq" = "$prev" ]; then
+        # Content hasn't moved — only a real stall if the target is still `working`. A
+        # `blocked` pane (e.g. under a caller-narrowed --states that excludes `blocked`) is
+        # legitimately static: it's waiting on input, not stuck.
+        status="$(parse_agent_status "$RESP" || true)"
+        if [ "$status" = "working" ]; then
+          if [ -n "${STALL_PREV_WORKING_ARR[$i]:-}" ]; then
+            # This is the SECOND bracketing tick observed unchanged+working (an intervening
+            # probe-miss/no-seq tick does not reset the bracket, by design) — the two
+            # observations bracket a full window, so a single ambiguous sample (e.g. a
+            # pane checked right after it stopped being legitimately blocked, whose
+            # between-tick blocked time this rule can't otherwise see) can never fire on
+            # its own; only a confirmed full window can.
+            printf '{"pane_id":"%s","suspected_stall_s":%s,"detection_content_seq":%s,"agent_status":"%s","ts":"%s"}\n' \
+              "$t" "$(( NOW_TS - STALL_TS_ARR[i] ))" "$seq" "$status" "$(now_iso)"
+            exit 5
+          fi
+          # First unchanged+working observation of a new bracket — record it and restart
+          # the clock so the elapsed time reported on a future fire reflects only the
+          # confirmed working window, not whatever came before it.
+          STALL_PREV_WORKING_ARR[$i]=1
+          STALL_TS_ARR[$i]="$NOW_TS"
+          continue
+        fi
+        # Static but not verified `working` (e.g. currently `blocked`) — this interval must
+        # not count toward a future working-stall verdict, so restart the clock and the
+        # bracket.
+        STALL_PREV_WORKING_ARR[$i]=""
+        STALL_TS_ARR[$i]="$NOW_TS"
+        continue
+      fi
+
+      STALL_PREV_WORKING_ARR[$i]=""
+      STALL_SEQ_ARR[$i]="$seq"
+      STALL_TS_ARR[$i]="$NOW_TS"
     done
   fi
 
