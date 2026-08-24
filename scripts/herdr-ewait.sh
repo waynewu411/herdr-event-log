@@ -10,9 +10,12 @@
 #                   --log <file> --cursor-file <file> \
 #                   [--overall-timeout 3600] [--poll 5] [--safety-net 60] \
 #                   [--stall-after 0]
+#   herdr-ewait.sh --help    # full usage to stdout, exit 0
 #
 # Stdout on success (exit 0): exactly one compact JSON line, nothing else:
 #   {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>"}
+# (Exception: --help/-h also exits 0 but prints human-readable help to stdout, NOT a JSON hit
+# line — a caller parsing exit-0 stdout as a hit must not pass --help/-h. See print_help below.)
 # Stdout on a suspected stall (exit 5): one compact JSON line, nothing else:
 #   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","ts":"<ISO8601 UTC>"}
 # Stdout on a target unreachable for a full --stall-after window (exit 5): detection_content_seq
@@ -72,6 +75,19 @@
 #   Comparing across a `--stall-after` window lets the target's *direct parent* — the only
 #   party allowed to look at it at all — detect a real stall without a skip-level `pane
 #   read` of a grandchild, and without waiting out the full `--overall-timeout` to find out.
+#
+# Rule 7 — --states separator normalization (#903, fixes a live #898 bug):
+#   Both grep call sites below splice $STATES verbatim into an ERE alternation
+#   (`^($STATES)$`), which only ever worked for a pipe-delimited value. A comma-delimited
+#   value — the natural mistake, since --targets itself is comma-delimited — collapses the
+#   alternation to a single literal branch that matches nothing, silently killing every
+#   state-detection path (rules 1, 5, and the log pre-filter) with zero error, hanging the
+#   caller to --overall-timeout (this actually froze the #898 delivery for ~15 minutes). Rule
+#   7 normalizes --states immediately after argument parsing: comma/whitespace/pipe separators
+#   are all accepted in any combination (runs and surrounding whitespace collapse) and
+#   canonicalized to a pipe alternation, and every token is validated against the three real
+#   states — an unknown token, or a value with no real state at all, is now a loud usage error
+#   (exit 4), never a silent no-op filter.
 
 set -euo pipefail
 
@@ -86,11 +102,63 @@ STALL_AFTER=0   # rule 6: opt-in; 0 = disabled, fully backward compatible
 
 usage() {
   echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N] [--stall-after N]" >&2
+  echo "run '$0 --help' for full usage" >&2
   exit 4
+}
+
+# --help / -h: full usage to STDOUT, exit 0 (a discoverable entry point so an agent can learn the
+# contract without reading the source or tripping the exit-4 usage() error). Kept in sync with the
+# flag list, the --states contract (rule 7), and the exit codes documented in the header above.
+print_help() {
+  cat <<'EOF'
+herdr-ewait.sh — the hardened event-log consumer for deliver-with-herdr.
+The single entry point for ANY agent waiting on ANY agent, at every nesting level.
+
+USAGE:
+  herdr-ewait.sh --targets "id1,id2" --log <file> --cursor-file <file> \
+                 [--states "blocked|done|idle"] \
+                 [--overall-timeout 3600] [--poll 5] [--safety-net 60] [--stall-after 0]
+  herdr-ewait.sh --help
+
+REQUIRED:
+  --targets "id1,id2"   Comma-separated pane ids to watch. Wakes on whichever moves first.
+  --log <file>          The herdr-event-log file (the event bus) to consume.
+  --cursor-file <file>  This waiter's own byte-cursor file (independent per consumer).
+
+OPTIONAL:
+  --states "s1|s2"      States that count as a hit. Default: blocked|done|idle.
+                        Separators: comma, whitespace, and pipe are all accepted, in any
+                        combination — runs and surrounding whitespace collapse (e.g.
+                        "idle,done" == "idle done" == "idle | done" == "idle|done").
+                        Allowed tokens: blocked, done, idle. An unknown token, or a value
+                        with no real state at all, is a usage error (exit 4) — never a
+                        silent no-op filter. Prefer omitting this unless you genuinely need
+                        to NARROW the set — the default already covers blocked|done|idle.
+  --overall-timeout N   Max seconds to wait before giving up. Default: 3600.
+  --poll N              Seconds between log-cursor polls. Default: 5.
+  --safety-net N        Seconds between unconditional live `agent get` sweeps. Default: 60.
+  --stall-after N       Opt-in working-stall detection window in seconds. Default: 0 (off).
+                        Size it well under a third of --overall-timeout (see header, rule 6).
+  --help, -h            Print this help to stdout and exit 0.
+
+EXIT CODES:
+  0  hit — a target reached one of --states, verified live by `herdr agent get`
+     (also exit 0 for --help/-h, which prints this help to stdout instead of a hit JSON line)
+  2  overall timeout reached with no verified hit
+  3  log file missing/unreadable at start (caller falls back to `herdr agent wait`)
+  4  usage error (bad/missing flag, an unknown --states token, or --states with no real state)
+  5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
+
+STDOUT (one compact JSON line — except --help/-h, which prints this help text):
+  hit (exit 0):    {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>"}
+  stall (exit 5):  {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","ts":"..."}
+EOF
+  exit 0
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    -h|--help) print_help ;;
     --targets) TARGETS="$2"; shift 2 ;;
     --states) STATES="$2"; shift 2 ;;
     --log) LOG="$2"; shift 2 ;;
@@ -114,6 +182,25 @@ done
 # like the non-numeric case this guard exists to catch.
 case "$STALL_AFTER" in ''|*[!0-9]*) usage ;; esac
 [ "${#STALL_AFTER}" -le 9 ] || usage
+
+# rule 7 (#903): normalize + validate --states before it ever reaches an ERE. Both grep call sites
+# below splice $STATES verbatim into "^($STATES)$"-shaped alternations, which only works when the
+# caller's separator is a pipe — a comma-delimited value (the natural typo, since --targets uses
+# commas) collapses to a single literal branch that matches nothing, silently killing every
+# state-detection path (rule 1, rule 5, the log pre-filter) with no error, just a hang to
+# --overall-timeout (this froze the #898 delivery for ~15 minutes). Accept comma, whitespace, and
+# pipe separators in ANY combination — including whitespace around a comma/pipe ("blocked, done",
+# "blocked | done") — by translating each to a pipe, squeezing separator RUNS to one, and trimming
+# the ends. Collapsing redundant/leading/trailing separators is safe: it only ever yields a valid
+# sub-filter of real states, never a silently-wrong one (unlike the original comma bug, which
+# matched nothing). What IS rejected loudly (exit 4) is a value with no real state at all, or any
+# token that is not blocked/done/idle — never a silent no-op filter.
+STATES="$(printf '%s' "$STATES" | tr ',[:space:]' '|' | tr -s '|' | sed 's/^|//; s/|$//')"
+[ -n "$STATES" ] || usage
+IFS='|' read -r -a _states <<< "$STATES"
+for s in "${_states[@]}"; do
+  case "$s" in blocked|done|idle) ;; *) echo "herdr-ewait: invalid --states token '$s' (allowed: blocked done idle, separated by comma/space/pipe)" >&2; usage ;; esac
+done
 
 # --- log availability check (exit 3 = caller falls back to the degraded path) ---
 if [ ! -r "$LOG" ]; then
