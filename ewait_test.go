@@ -254,11 +254,27 @@ func TestEwait_CeilingAlone_MentionsMilliseconds(t *testing.T) {
 	}
 }
 
-// L4 fix (#9 round-3 review): --overall-timeout itself needs a ceiling too — issue 9's
-// own exact mistake (2400000, ~28 days) survives validation when --poll/--safety-net are
-// both omitted, since only they had a ceiling before this fix.
-func TestEwait_OverallTimeoutCeiling_MentionsMilliseconds(t *testing.T) {
+// L4 fix (#9 round-3 review): --overall-timeout itself needs a ceiling check too —
+// issue 9's own exact mistake (2400000, ~28 days) survives validation when
+// --poll/--safety-net are both omitted, since only they had a ceiling before this fix.
+//
+// Round-4 review (L3): issue 9 scoped the hard 300s ceiling to --poll/--safety-net only
+// ("--poll or --safety-net exceeds a sane ceiling"); it never asked for one on
+// --overall-timeout, and a 27.8h --overall-timeout (100000s) ran fine on `main`. Making
+// this a hard reject broke that previously-valid invocation beyond what issue 9 asked
+// for. Past the 24h ceiling this now WARNS on stderr (still naming the millisecond
+// mistake) and keeps running with the caller's value, rather than exiting 4 — restoring
+// compatibility for a genuine long supervision wait while still flagging the
+// issue's own kind of mistake.
+func TestEwait_OverallTimeoutCeiling_WarnsButStillRuns(t *testing.T) {
 	logPath, cursorPath := newEwaitFiles(t)
+	// flipAt 0: every probe (including check-first) reports "done" immediately, so the
+	// huge --overall-timeout is never actually waited out.
+	stub := stubConfig{
+		paneID:      "w1:p1",
+		flipAt:      0,
+		counterFile: filepath.Join(t.TempDir(), "counter"),
+	}
 	args := []string{
 		"--targets", "w1:p1",
 		"--log", logPath,
@@ -266,13 +282,37 @@ func TestEwait_OverallTimeoutCeiling_MentionsMilliseconds(t *testing.T) {
 		"--overall-timeout", "2400000",
 	}
 
-	res := runEwait(t, args, stubConfig{}, 10*time.Second)
+	res := runEwait(t, args, stub, 10*time.Second)
 
-	if res.exitCode != 4 {
-		t.Fatalf("exit code = %d, want 4; stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	if res.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0 (a large --overall-timeout must warn, not reject); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
 	}
 	if !strings.Contains(res.stderr, "millisecond") {
-		t.Fatalf("overall-timeout ceiling error should call out the millisecond-vs-second mistake; stderr: %q", res.stderr)
+		t.Fatalf("a --overall-timeout past the ceiling should still warn about the millisecond-vs-second mistake; stderr: %q", res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"pane_id":"w1:p1"`) {
+		t.Fatalf("expected a hit line on stdout; stdout: %q", res.stdout)
+	}
+}
+
+func TestEwait_OverallTimeoutJustOverCeiling_StillAcceptedWithWarning(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		paneID:      "w1:p1",
+		flipAt:      0,
+		counterFile: filepath.Join(t.TempDir(), "counter"),
+	}
+	args := []string{
+		"--targets", "w1:p1",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--overall-timeout", "100000", // 27.8h: ran fine on main, must not regress
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0 (100000s overall-timeout is not a ceiling violation on main and must stay accepted); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
 	}
 }
 
@@ -369,6 +409,41 @@ func TestEwait_CheckFirstHit(t *testing.T) {
 		t.Fatalf(`a pane-id caller should see "target" equal to its own pane_id; got: %q`, res.stdout)
 	}
 	assertSingleJSONLine(t, res.stdout)
+}
+
+// Round-4 review (N1): "target" must be APPENDED after "ts", not inserted before it — the
+// PR describes the field as purely additive, but inserting it between "verified_state"
+// and "ts" reorders the line, which breaks a consumer matching on
+// `..."verified_state":"...","ts":...` positionally or by regex.
+func TestEwait_HitLine_TargetAppendedAfterTs(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		paneID:      "w1:p1",
+		flipAt:      0,
+		counterFile: filepath.Join(t.TempDir(), "counter"),
+	}
+	args := []string{
+		"--targets", "w1:p1",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %q", res.exitCode, res.stderr)
+	}
+	tsIdx := strings.Index(res.stdout, `"ts":`)
+	targetIdx := strings.Index(res.stdout, `"target":`)
+	if tsIdx == -1 || targetIdx == -1 {
+		t.Fatalf(`expected both "ts" and "target" in stdout; got: %q`, res.stdout)
+	}
+	if targetIdx < tsIdx {
+		t.Fatalf(`"target" must come after "ts" (appended, not inserted before it); got: %q`, res.stdout)
+	}
+	if !strings.HasSuffix(strings.TrimRight(res.stdout, "\n"), "}") {
+		t.Fatalf(`"target" should be the last field before the closing brace; got: %q`, res.stdout)
+	}
 }
 
 func TestEwait_LogHit(t *testing.T) {

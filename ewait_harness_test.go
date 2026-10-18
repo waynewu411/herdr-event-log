@@ -49,10 +49,15 @@ package main
 //     calls, then falls through to the counter-based branch below, using
 //     the target itself as the resolved pane_id — a pane that exists but
 //     whose agent herdr hasn't classified yet;
-//   - a target found in $HERDR_STUB_MAP ("name1=pane1;name2=pane2")
-//     resolves to the mapped pane id and reports "working" forever — no
-//     counter, used to check multi-target resolution/diagnostics without
-//     needing a hit;
+//   - a target found in $HERDR_STUB_MAP ("name1=pane1;name2=pane2") — matched
+//     by EXACT name OR mapped pane id, never a substring (round-4 review,
+//     L2: a plain `grep -F "${target}="` both missed every post-resolution
+//     probe of the mapped pane id, since only the name side of the "="
+//     ever appeared verbatim on the left, and could false-match a target
+//     whose name is a suffix of another entry's, e.g. "alice" against a
+//     "malice=..." line) — resolves to/reports the mapped pane id with
+//     "working" forever, for either form. No counter, used to check
+//     multi-target resolution/diagnostics without needing a hit;
 //   - $HERDR_STUB_MOVED_NAME simulates a mid-wait `herdr pane move`: its
 //     first call (the startup resolve) reports $HERDR_STUB_MOVED_OLD_PANE
 //     with agent_status "working"; every call after that reports
@@ -153,11 +158,18 @@ fi
 
 map="${HERDR_STUB_MAP:-}"
 if [ -n "$map" ]; then
-  mapped="$(printf '%s' "$map" | tr ';' '\n' | grep -F "${target}=" | head -n1 | sed 's/^[^=]*=//')"
-  if [ -n "$mapped" ]; then
-    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "$mapped"
-    exit 0
-  fi
+  old_ifs="$IFS"
+  IFS=';'
+  for entry in $map; do
+    name="${entry%%=*}"
+    pane="${entry#*=}"
+    if [ "$target" = "$name" ] || [ "$target" = "$pane" ]; then
+      IFS="$old_ifs"
+      printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "$pane"
+      exit 0
+    fi
+  done
+  IFS="$old_ifs"
 fi
 
 moved_name="${HERDR_STUB_MOVED_NAME:-}"
@@ -305,6 +317,32 @@ func writeHerdrStub(t *testing.T, dir string) {
 	if err := os.WriteFile(path, []byte(herdrStubScript), 0o755); err != nil {
 		t.Fatalf("write herdr stub: %v", err)
 	}
+}
+
+// runHerdrStub invokes the fake `herdr` binary directly (not via
+// herdr-ewait.sh) — used to unit-test the stub's own branches, such as
+// HERDR_STUB_MAP's name/pane-id matching (round-4 review, L2), in isolation
+// from the script under test.
+func runHerdrStub(t *testing.T, stub stubConfig, args ...string) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	dir := t.TempDir()
+	writeHerdrStub(t, dir)
+	cmd := exec.Command(filepath.Join(dir, "herdr"), args...)
+	cmd.Env = stub.env()
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run herdr stub: %v", err)
+		}
+	}
+	return out.String(), errBuf.String(), code
 }
 
 // minimalToolsPath builds a PATH containing only the directories that hold

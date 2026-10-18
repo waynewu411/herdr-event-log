@@ -413,6 +413,39 @@ func TestEwait_TwoResolvableTargets_DiagnosticListsBothMappings(t *testing.T) {
 	}
 }
 
+// --- L2 (round 4): the HERDR_STUB_MAP branch must answer for the mapped pane id too
+// (every post-resolution probe uses it, not the name), and must match by exact name or
+// pane id — never a substring — or TestEwait_TwoResolvableTargets_DiagnosticListsBothMappings
+// above silently runs in a "every probe after resolution fails" world instead of the
+// "two healthy, working-forever targets" one its name claims. ---
+
+func TestHerdrStub_MapAnswersForBothNameAndMappedPaneID(t *testing.T) {
+	requireEwaitTools(t)
+	stub := stubConfig{mapEntries: "alice=w7:p3;bob=w8:p1"}
+
+	for _, target := range []string{"alice", "w7:p3"} {
+		stdout, stderr, code := runHerdrStub(t, stub, "agent", "get", target)
+		if code != 0 {
+			t.Fatalf("agent get %q: exit %d, want 0; stdout: %q stderr: %q", target, code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, `"pane_id":"w7:p3"`) || !strings.Contains(stdout, `"agent_status":"working"`) {
+			t.Fatalf("agent get %q: unexpected stdout: %q", target, stdout)
+		}
+	}
+}
+
+func TestHerdrStub_MapLookupDoesNotSubstringMatch(t *testing.T) {
+	requireEwaitTools(t)
+	// "alice" is not a key in this map, but is a suffix of "malice" — a substring
+	// lookup (grep -F "alice=") would wrongly match the "malice=..." line.
+	stub := stubConfig{mapEntries: "malice=w9:p9;bob=w8:p1"}
+
+	_, stderr, code := runHerdrStub(t, stub, "agent", "get", "alice")
+	if code == 0 {
+		t.Fatalf("agent get %q unexpectedly succeeded against an unrelated map entry it is a substring of; stderr: %q", "alice", stderr)
+	}
+}
+
 // --- N2 (round 2): the startup diagnostic prints even when check-first hits immediately ---
 
 func TestEwait_DiagnosticPrintedEvenOnImmediateHit(t *testing.T) {
