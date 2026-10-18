@@ -53,6 +53,14 @@ package main
 //     resolves to the mapped pane id and reports "working" forever — no
 //     counter, used to check multi-target resolution/diagnostics without
 //     needing a hit;
+//   - $HERDR_STUB_MOVED_NAME simulates a mid-wait `herdr pane move`: its
+//     first call (the startup resolve) reports $HERDR_STUB_MOVED_OLD_PANE
+//     with agent_status "working"; every call after that reports
+//     $HERDR_STUB_MOVED_NEW_PANE instead. $HERDR_STUB_MOVED_OLD_PANE's OWN
+//     first call (check-first, using the resolved id) reports "working";
+//     every call after that fails with agent_not_found on stderr — as if
+//     the old pane_id stopped resolving once the pane moved.
+//     $HERDR_STUB_MOVED_NEW_PANE always reports "done" (round-3 review, L5);
 //   - any other target increments a shared counter file and reports
 //     pane_id = $HERDR_STUB_PANE_ID with agent_status "working" while the
 //     counter is <= $HERDR_STUB_FLIP_AT, then "done" after that. This lets
@@ -152,6 +160,40 @@ if [ -n "$map" ]; then
   fi
 fi
 
+moved_name="${HERDR_STUB_MOVED_NAME:-}"
+if [ -n "$moved_name" ] && [ "$target" = "$moved_name" ]; then
+  cf="${HERDR_STUB_MOVED_NAME_COUNTER_FILE:?missing}"
+  n=0
+  if [ -f "$cf" ]; then n="$(cat "$cf")"; fi
+  n=$((n+1)); printf '%s' "$n" > "$cf"
+  if [ "$n" -eq 1 ]; then
+    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "${HERDR_STUB_MOVED_OLD_PANE:?missing}"
+  else
+    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "${HERDR_STUB_MOVED_NEW_PANE:?missing}"
+  fi
+  exit 0
+fi
+
+moved_old="${HERDR_STUB_MOVED_OLD_PANE:-}"
+if [ -n "$moved_old" ] && [ "$target" = "$moved_old" ]; then
+  cf="${HERDR_STUB_MOVED_OLD_COUNTER_FILE:?missing}"
+  n=0
+  if [ -f "$cf" ]; then n="$(cat "$cf")"; fi
+  n=$((n+1)); printf '%s' "$n" > "$cf"
+  if [ "$n" -eq 1 ]; then
+    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "$target"
+    exit 0
+  fi
+  printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"},"id":"cli:agent:get"}\n' "$target" >&2
+  exit 1
+fi
+
+moved_new="${HERDR_STUB_MOVED_NEW_PANE:-}"
+if [ -n "$moved_new" ] && [ "$target" = "$moved_new" ]; then
+  printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"done"}\n' "$target"
+  exit 0
+fi
+
 counter_file="${HERDR_STUB_COUNTER_FILE:?missing}"
 flip_at="${HERDR_STUB_FLIP_AT:?missing}"
 pane_id="${HERDR_STUB_PANE_ID:?missing}"
@@ -172,19 +214,24 @@ printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"%s"}\n' "$pane_id" 
 // (no target will ever match a special case, and the default-case branch is
 // simply never reached if the script never calls herdr).
 type stubConfig struct {
-	unresolvable      string // comma-separated targets -> agent_not_found error, exit 1
-	alwaysWorking     string // comma-separated targets -> identity pane_id, "working" forever
-	notYetDetected    string // single target -> agent_not_found for detectAfter calls, then falls through
-	detectAfter       int
-	detectCounterFile string
-	mapEntries        string // "name1=pane1;name2=pane2" -> mapped pane_id, "working" forever
-	paneID            string
-	flipAt            int
-	counterFile       string
-	omitHerdr         bool   // if true, herdr is absent from PATH entirely
-	serverDown        bool   // if true, every herdr call fails with server_not_running
-	paneNotFound      string // comma-separated targets -> `herdr pane get` fails with pane_not_found
-	weirdShape        string // comma-separated targets -> success (exit 0) with no pane_id field
+	unresolvable         string // comma-separated targets -> agent_not_found error, exit 1
+	alwaysWorking        string // comma-separated targets -> identity pane_id, "working" forever
+	notYetDetected       string // single target -> agent_not_found for detectAfter calls, then falls through
+	detectAfter          int
+	detectCounterFile    string
+	mapEntries           string // "name1=pane1;name2=pane2" -> mapped pane_id, "working" forever
+	paneID               string
+	flipAt               int
+	counterFile          string
+	omitHerdr            bool   // if true, herdr is absent from PATH entirely
+	serverDown           bool   // if true, every herdr call fails with server_not_running
+	paneNotFound         string // comma-separated targets -> `herdr pane get` fails with pane_not_found
+	weirdShape           string // comma-separated targets -> success (exit 0) with no pane_id field
+	movedName            string // name whose resolution changes pane_id after its first call
+	movedOldPane         string
+	movedNewPane         string
+	movedNameCounterFile string
+	movedOldCounterFile  string
 }
 
 func (c stubConfig) env() []string {
@@ -217,6 +264,13 @@ func (c stubConfig) env() []string {
 	}
 	if c.weirdShape != "" {
 		set("HERDR_STUB_WEIRD_SHAPE", c.weirdShape)
+	}
+	if c.movedName != "" {
+		set("HERDR_STUB_MOVED_NAME", c.movedName)
+		set("HERDR_STUB_MOVED_OLD_PANE", c.movedOldPane)
+		set("HERDR_STUB_MOVED_NEW_PANE", c.movedNewPane)
+		set("HERDR_STUB_MOVED_NAME_COUNTER_FILE", c.movedNameCounterFile)
+		set("HERDR_STUB_MOVED_OLD_COUNTER_FILE", c.movedOldCounterFile)
 	}
 	return env
 }

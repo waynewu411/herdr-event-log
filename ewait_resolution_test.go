@@ -253,6 +253,46 @@ func TestEwait_NonexistentPaneID_ExitsWithDedicatedCode(t *testing.T) {
 	}
 }
 
+// --- L5 (round 3): a mid-wait `herdr pane move` must not silently strand a name target ---
+
+func TestEwait_NameTargetMovedMidWait_SafetyNetReresolvesAndHits(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		movedName:            "deliverer",
+		movedOldPane:         "w2F:pA",
+		movedNewPane:         "w9Z:pZ",
+		movedNameCounterFile: filepath.Join(t.TempDir(), "moved-name-counter"),
+		movedOldCounterFile:  filepath.Join(t.TempDir(), "moved-old-counter"),
+	}
+
+	args := []string{
+		"--targets", "deliverer", // a name, not a pane id
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "1",
+		"--safety-net", "1",
+		"--overall-timeout", "10",
+	}
+
+	// Never append anything to the log: only the safety-net sweep's re-resolve of the
+	// ORIGINAL name (not the log pre-filter, which only ever knows the stale old pane_id)
+	// can observe the move and the eventual hit on the new pane_id.
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0 (a mid-wait pane move must not strand a name target for the full --overall-timeout); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"pane_id":"w9Z:pZ"`) || !strings.Contains(res.stdout, `"verified_state":"done"`) {
+		t.Fatalf("unexpected stdout: %q", res.stdout)
+	}
+	if !strings.Contains(res.stdout, `"target":"deliverer"`) {
+		t.Fatalf(`hit line should still carry the original name as "target"; got: %q`, res.stdout)
+	}
+	if !strings.Contains(res.stderr, "deliverer") || !strings.Contains(res.stderr, "w9Z:pZ") {
+		t.Fatalf("stderr should note the re-resolution from the original name to the new pane_id; got: %q", res.stderr)
+	}
+}
+
 // --- L2 (round 3): a herdr success response with an unexpected shape must not fail-closed on a pane-id caller ---
 
 func TestEwait_UnexpectedSuccessShape_PaneID_KeepsWaitingAndStillHits(t *testing.T) {
