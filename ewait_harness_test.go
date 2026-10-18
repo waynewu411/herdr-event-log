@@ -16,11 +16,22 @@ package main
 // so `$code` was always empty — while the fake tests still passed, because
 // they were asserting against the stub's (wrong) stdout-based error.
 //
+// Round-3 review (#9, N3) re-checked the "server_not_running" stream claim
+// specifically, since N3 asserted it should be on stdout: re-verified live
+// on this machine (herdr 0.8.2) with explicit file redirection — stdout was
+// 0 bytes, stderr carried the full 162-byte error JSON, for both an unknown
+// agent and a dead socket. The stub's choice (stderr) is correct as-is; see
+// the round-3 report for the exact commands and byte counts.
+//
 // The stub implements `herdr agent get <target>` and `herdr pane get
 // <target>`:
 //   - if $HERDR_STUB_SERVER_DOWN is set, EVERY call (either subcommand,
 //     any target) fails with the real "server_not_running" shape on
 //     stderr, exit 1 — simulating a dead herdr socket;
+//   - a target in $HERDR_STUB_WEIRD_SHAPE (comma-separated) succeeds (exit
+//     0) with an agent_status but NO recognizable pane_id field — an
+//     unexpected/renamed response shape, not a failure herdr itself
+//     reported (round-3 review, L2);
 //   - `pane get`: a target in $HERDR_STUB_PANE_NOT_FOUND (comma-separated)
 //     fails with "pane_not_found" on stderr, exit 1; any other target
 //     succeeds with a pane_info response carrying its own pane_id (the
@@ -51,6 +62,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -88,6 +100,14 @@ fi
 if [ "$cmd" != "agent" ] || [ "$sub" != "get" ]; then
   exit 1
 fi
+
+weird_shape=",${HERDR_STUB_WEIRD_SHAPE:-},"
+case "$weird_shape" in
+  *",$target,"*)
+    printf '{"id":"cli:agent:get","agent_status":"done","pane":"%s"}\n' "$target"
+    exit 0
+    ;;
+esac
 
 unresolvable=",${HERDR_STUB_UNRESOLVABLE:-},"
 case "$unresolvable" in
@@ -164,6 +184,7 @@ type stubConfig struct {
 	omitHerdr         bool   // if true, herdr is absent from PATH entirely
 	serverDown        bool   // if true, every herdr call fails with server_not_running
 	paneNotFound      string // comma-separated targets -> `herdr pane get` fails with pane_not_found
+	weirdShape        string // comma-separated targets -> success (exit 0) with no pane_id field
 }
 
 func (c stubConfig) env() []string {
@@ -194,6 +215,9 @@ func (c stubConfig) env() []string {
 	if c.paneNotFound != "" {
 		set("HERDR_STUB_PANE_NOT_FOUND", c.paneNotFound)
 	}
+	if c.weirdShape != "" {
+		set("HERDR_STUB_WEIRD_SHAPE", c.weirdShape)
+	}
 	return env
 }
 
@@ -202,7 +226,7 @@ func requireEwaitTools(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("herdr-ewait.sh requires bash/grep/sed, not available on windows")
 	}
-	for _, tool := range []string{"bash", "grep", "sed", "tail", "wc"} {
+	for _, tool := range []string{"bash", "grep", "sed", "tail", "wc", "tr", "sleep"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not found in PATH: %v", tool, err)
 		}
@@ -233,10 +257,14 @@ func writeHerdrStub(t *testing.T, dir string) {
 // the core tools herdr-ewait.sh itself needs, with no herdr stub added —
 // used to simulate "herdr is not installed at all" without accidentally
 // picking up a real herdr binary that might happen to be on this machine's
-// normal PATH.
+// normal PATH. The list must cover every external tool the script invokes —
+// round-3 review (N6) found `tr` and `sleep` missing: harmless on a machine
+// where every tool shares one directory (e.g. /usr/bin), but on a split
+// layout the herdr-unreachable test would exit 127 from inside a command
+// substitution instead of the intended 6.
 func minimalToolsPath(t *testing.T) string {
 	t.Helper()
-	tools := []string{"bash", "grep", "sed", "tail", "wc", "cat", "date", "head"}
+	tools := []string{"bash", "grep", "sed", "tail", "wc", "cat", "date", "head", "tr", "sleep"}
 	dirSet := map[string]bool{}
 	for _, tool := range tools {
 		p, err := exec.LookPath(tool)
@@ -385,4 +413,21 @@ func readCounter(t *testing.T, path string) int {
 		t.Fatalf("parse counter file %s = %q: %v", path, data, err)
 	}
 	return n
+}
+
+// assertSingleJSONLine fails the test unless stdout is exactly one line that
+// parses as valid JSON (round-3 review, N4: every hit-test assertion so far
+// used strings.Contains on fragments, so a stray comma or quote introduced
+// while editing emit_hit/the stall printfs would have passed every one of
+// them).
+func assertSingleJSONLine(t *testing.T, stdout string) {
+	t.Helper()
+	trimmed := strings.TrimRight(stdout, "\n")
+	if n := strings.Count(trimmed, "\n"); n != 0 {
+		t.Fatalf("stdout must be exactly one line, found %d newlines in: %q", n, stdout)
+	}
+	var v map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &v); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v; got: %q", err, stdout)
+	}
 }
