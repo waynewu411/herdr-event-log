@@ -198,6 +198,15 @@ scripts/herdr-ewait.sh \
   fresh pane) is kept as-is and the script keeps waiting, not rejected.
   The hit/stall JSON also carries this original entry back as `"target"`,
   alongside the resolved `"pane_id"`.
+- A *name* target's resolved `pane_id` can go stale mid-wait — e.g. `herdr
+  pane move` gives the pane a new, workspace-qualified `pane_id` and the old
+  one stops resolving. The safety-net sweep (the `--safety-net` ticks)
+  detects this itself: the first time a live probe of the current `pane_id`
+  comes back completely empty, it re-resolves the *original* name and, if
+  that now points at a different `pane_id`, switches to it and keeps
+  waiting (with a note on stderr) instead of stranding the wait on a dead
+  pane for the rest of `--overall-timeout`. A `pane_id` target given
+  directly is never re-resolved — there is no name to fall back on.
 - `--states` is a `|`-separated regex of statuses to accept; the default is
   `blocked|done|idle`.
 - `--log` is the per-instance event log described above.
@@ -319,7 +328,9 @@ make clean   # remove the built binary
   clamped to fit a short explicit `--overall-timeout` rather than rejected,
   while passing all three explicitly and then shortening only
   `--overall-timeout` still correctly errors — and the
-  check-first/log-hit/safety-net-hit/overall-timeout paths.
+  check-first/log-hit/safety-net-hit/overall-timeout paths, plus a name
+  target's `pane_id` moving mid-wait (the safety-net sweep re-resolves the
+  name and switches to the new `pane_id` instead of stranding the wait).
 
 None of this requires a live Herdr session. A GitHub Actions workflow
 (`.github/workflows/test.yml`) runs `make fmt`, `make vet`, `make build`, and
