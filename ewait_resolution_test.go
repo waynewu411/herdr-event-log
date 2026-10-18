@@ -144,37 +144,109 @@ func TestEwait_HerdrUnreachable_ExitsWithDedicatedCode(t *testing.T) {
 	}
 }
 
-// --- M1 (round 2): "server down" — herdr present but its socket is dead ---
+// L3 fix (#9 round-5 review): the non-JSON-failure flavor of the same ride-it-out
+// behavior — herdr entirely absent from PATH, not just its socket being down — for a
+// pane-id-shaped target.
+func TestEwait_HerdrUnreachable_PaneIDTarget_RidesOutInsteadOfExit6(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{omitHerdr: true}
 
-func TestEwait_ServerDown_ExitsWithDedicatedCode(t *testing.T) {
-	cases := []struct {
-		name   string
-		target string
-	}{
-		{"name target", "some-agent-name"},
-		{"pane-id target", "w1:p9"}, // pane-id-shaped: must NOT trigger the H1/M2 "keep waiting" fallback
+	args := []string{
+		"--targets", "w1:p9",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--overall-timeout", "2",
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			logPath, cursorPath := newEwaitFiles(t)
-			stub := stubConfig{serverDown: true}
+	res := runEwait(t, args, stub, 10*time.Second)
 
-			args := []string{
-				"--targets", tc.target,
-				"--log", logPath,
-				"--cursor-file", cursorPath,
-			}
+	if res.exitCode == 6 {
+		t.Fatalf("exit code = 6 (a pane-id caller must ride out herdr being entirely absent at startup, as main did); stderr: %q", res.stderr)
+	}
+	if res.exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2 (herdr never appears in this stub, so it should simply time out, not fail closed); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+}
 
-			res := runEwait(t, args, stub, 10*time.Second)
+// --- M1 (round 2): "server down" — herdr present but its socket is dead ---
+// A NAME target still has no identity to fall back on, so it still exits 6.
 
-			if res.exitCode != 6 {
-				t.Fatalf("exit code = %d, want 6; stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
-			}
-			if !strings.Contains(res.stderr, "server_not_running") {
-				t.Fatalf("stderr should surface herdr's server_not_running code; got: %q", res.stderr)
-			}
-		})
+func TestEwait_ServerDown_NameTarget_ExitsWithDedicatedCode(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{serverDown: true}
+
+	args := []string{
+		"--targets", "some-agent-name",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 6 {
+		t.Fatalf("exit code = %d, want 6; stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "server_not_running") {
+		t.Fatalf("stderr should surface herdr's server_not_running code; got: %q", res.stderr)
+	}
+}
+
+// L3 fix (#9 round-5 review): on `main`, a pane-id caller had nothing to resolve and so
+// rode out a transient herdr outage at startup for free (every probe is unconditionally
+// tolerant, `|| true`). Resolution introduced a NEW hard failure for this exact case —
+// exit 6 on herdr simply being down for a moment — that main never had. Issue 9 never
+// asked to fail closed on "herdr itself is temporarily unreachable" for a target that
+// already IS a pane id; only a genuinely bad target (an unresolvable name, or a pane id
+// confirmed via `herdr pane get` not to exist) should exit 6.
+func TestEwait_ServerDown_PaneIDTarget_RidesOutInsteadOfExit6(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{serverDown: true} // never recovers in this stub config
+
+	args := []string{
+		"--targets", "w1:p9",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--overall-timeout", "2",
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode == 6 {
+		t.Fatalf("exit code = 6 (a pane-id caller must ride out a herdr outage at startup, as main did); stderr: %q", res.stderr)
+	}
+	if res.exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2 (herdr never recovers in this stub, so it should simply time out, not fail closed); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
+// The actual point of riding it out: once herdr comes back, the wait succeeds, exactly
+// like main would have.
+func TestEwait_ServerDown_PaneIDTarget_RecoversAndHits(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		serverDownForCalls:    2, // resolution + check-first both see the outage
+		serverDownCounterFile: filepath.Join(t.TempDir(), "server-down-counter"),
+		paneID:                "w1:p9",
+		flipAt:                0, // "done" as soon as herdr recovers
+		counterFile:           filepath.Join(t.TempDir(), "counter"),
+	}
+
+	args := []string{
+		"--targets", "w1:p9",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "1",
+		"--safety-net", "1",
+		"--overall-timeout", "10",
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0 (once herdr recovers, the wait must still succeed); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"pane_id":"w1:p9"`) || !strings.Contains(res.stdout, `"verified_state":"done"`) {
+		t.Fatalf("unexpected stdout: %q", res.stdout)
 	}
 }
 
@@ -291,6 +363,124 @@ func TestEwait_NameTargetMovedMidWait_SafetyNetReresolvesAndHits(t *testing.T) {
 	if !strings.Contains(res.stderr, "deliverer") || !strings.Contains(res.stderr, "w9Z:pZ") {
 		t.Fatalf("stderr should note the re-resolution from the original name to the new pane_id; got: %q", res.stderr)
 	}
+}
+
+// L1 fix (#9 round-5 review): the L5 re-resolution above only runs inside the safety-net
+// sweep. The STALL sweep (rule 6) probed the stale pane_id directly and counted every
+// empty response toward "unreachable for a full window" — so a mid-wait pane move could
+// trip a false exit 5 ("may no longer exist") if the --stall-after window elapsed before
+// the next safety-net tick, even though the agent is alive under its new pane_id. Using a
+// --stall-after shorter than --safety-net deliberately lets the stall sweep observe the
+// stale pane_id first; the fix must re-resolve there too before counting the miss.
+func TestEwait_StallSweep_MovedNameTarget_NoFalseExitFive_ThenHits(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		movedName:            "deliverer",
+		movedOldPane:         "w2F:pA",
+		movedNewPane:         "w9Z:pZ",
+		movedNameCounterFile: filepath.Join(t.TempDir(), "moved-name-counter"),
+		movedOldCounterFile:  filepath.Join(t.TempDir(), "moved-old-counter"),
+	}
+
+	args := []string{
+		"--targets", "deliverer",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "1",
+		"--safety-net", "4",
+		"--stall-after", "1",
+		"--overall-timeout", "10",
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode == 5 {
+		t.Fatalf("exit 5 (false stall/unreachable) on a target that only moved; stdout: %q stderr: %q", res.stdout, res.stderr)
+	}
+	if res.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0 (the stall sweep must not strand a moved name target); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"pane_id":"w9Z:pZ"`) {
+		t.Fatalf("expected an eventual hit on the new pane_id; stdout: %q", res.stdout)
+	}
+}
+
+// L4 fix (#9 round-5 review): neither exit-5 stall line had a test exercising it — the
+// hit line gets assertSingleJSONLine precisely because fragment matching would miss a
+// stray quote/comma in a printf, and the two stall printfs were edited in this PR (the
+// "target" field was added, then its position fixed in round 4) with nothing covering
+// either. This also pins whatever decision L1 made: re-resolving the NAME does not
+// prevent a genuinely dead pane (not merely moved) from still reporting a real stall.
+//
+// Uses the existing movedOldPane/movedNewPane stub mechanism, but with BOTH set to the
+// SAME pane_id — "deliverer" always resolves to that one pane_id (never actually moves),
+// so reresolve_if_stale correctly finds nothing to update and falls through, and the
+// pane's own probe genuinely, permanently fails after its first call.
+func TestEwait_StallSweep_UnreachableTarget_ExitsFiveWithValidJSON(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		movedName:            "deliverer",
+		movedOldPane:         "w2F:pA",
+		movedNewPane:         "w2F:pA", // same pane_id: this target never actually moves
+		movedNameCounterFile: filepath.Join(t.TempDir(), "moved-name-counter"),
+		movedOldCounterFile:  filepath.Join(t.TempDir(), "moved-old-counter"),
+	}
+
+	args := []string{
+		"--targets", "deliverer",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "1",
+		"--safety-net", "300", // must not fire before the stall sweep does
+		"--stall-after", "2",
+		"--overall-timeout", "600",
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 5 {
+		t.Fatalf("exit code = %d, want 5; stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"detection_content_seq":null`) {
+		t.Fatalf(`expected "detection_content_seq":null (a genuine probe outage, not a seq-based stall); stdout: %q`, res.stdout)
+	}
+	if !strings.Contains(res.stdout, `"target":"deliverer"`) {
+		t.Fatalf(`stall line should carry the original name as "target"; got: %q`, res.stdout)
+	}
+	assertSingleJSONLine(t, res.stdout)
+}
+
+// The other exit-5 shape: content unchanged across two bracketing ticks while still
+// `working` (not a probe outage at all — detection_content_seq is present and stable).
+func TestEwait_StallSweep_WorkingUnchanged_ExitsFiveWithValidJSON(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{
+		alwaysWorking: "w1:p1",
+		contentSeq:    "42", // constant across every call: never "moves"
+	}
+
+	args := []string{
+		"--targets", "w1:p1",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "1",
+		"--safety-net", "300",
+		"--stall-after", "1",
+		"--overall-timeout", "600",
+	}
+
+	res := runEwait(t, args, stub, 10*time.Second)
+
+	if res.exitCode != 5 {
+		t.Fatalf("exit code = %d, want 5; stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"detection_content_seq":42`) || !strings.Contains(res.stdout, `"agent_status":"working"`) {
+		t.Fatalf("unexpected stdout: %q", res.stdout)
+	}
+	if !strings.Contains(res.stdout, `"target":"w1:p1"`) {
+		t.Fatalf(`stall line should carry "target"; got: %q`, res.stdout)
+	}
+	assertSingleJSONLine(t, res.stdout)
 }
 
 // --- L2 (round 3): a herdr success response with an unexpected shape must not fail-closed on a pane-id caller ---
@@ -413,95 +603,6 @@ func TestEwait_TwoResolvableTargets_DiagnosticListsBothMappings(t *testing.T) {
 	}
 }
 
-// --- L2 (round 4): the HERDR_STUB_MAP branch must answer for the mapped pane id too
-// (every post-resolution probe uses it, not the name), and must match by exact name or
-// pane id — never a substring — or TestEwait_TwoResolvableTargets_DiagnosticListsBothMappings
-// above silently runs in a "every probe after resolution fails" world instead of the
-// "two healthy, working-forever targets" one its name claims. ---
-
-func TestHerdrStub_MapAnswersForBothNameAndMappedPaneID(t *testing.T) {
-	requireEwaitTools(t)
-	stub := stubConfig{mapEntries: "alice=w7:p3;bob=w8:p1"}
-
-	for _, target := range []string{"alice", "w7:p3"} {
-		stdout, stderr, code := runHerdrStub(t, stub, "agent", "get", target)
-		if code != 0 {
-			t.Fatalf("agent get %q: exit %d, want 0; stdout: %q stderr: %q", target, code, stdout, stderr)
-		}
-		if !strings.Contains(stdout, `"pane_id":"w7:p3"`) || !strings.Contains(stdout, `"agent_status":"working"`) {
-			t.Fatalf("agent get %q: unexpected stdout: %q", target, stdout)
-		}
-	}
-}
-
-func TestHerdrStub_MapLookupDoesNotSubstringMatch(t *testing.T) {
-	requireEwaitTools(t)
-	// "alice" is not a key in this map, but is a suffix of "malice" — a substring
-	// lookup (grep -F "alice=") would wrongly match the "malice=..." line.
-	stub := stubConfig{mapEntries: "malice=w9:p9;bob=w8:p1"}
-
-	_, stderr, code := runHerdrStub(t, stub, "agent", "get", "alice")
-	if code == 0 {
-		t.Fatalf("agent get %q unexpectedly succeeded against an unrelated map entry it is a substring of; stderr: %q", "alice", stderr)
-	}
-}
-
-// --- N2 (round 2): the startup diagnostic prints even when check-first hits immediately ---
-
-func TestEwait_DiagnosticPrintedEvenOnImmediateHit(t *testing.T) {
-	logPath, cursorPath := newEwaitFiles(t)
-	stub := stubConfig{
-		paneID:      "w1:p1",
-		flipAt:      0, // every call reports "done" -> hits on check-first
-		counterFile: filepath.Join(t.TempDir(), "counter"),
-	}
-	args := []string{
-		"--targets", "w1:p1",
-		"--log", logPath,
-		"--cursor-file", cursorPath,
-	}
-
-	res := runEwait(t, args, stub, 10*time.Second)
-
-	if res.exitCode != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr: %q", res.exitCode, res.stderr)
-	}
-	for _, want := range []string{"targets=w1:p1=w1:p1", "stall-after=0s"} {
-		if !strings.Contains(res.stderr, want) {
-			t.Errorf("startup diagnostic missing %q even though the run hit immediately; stderr: %q", want, res.stderr)
-		}
-	}
-}
-
-// N5 fix (#9 round-3 review): --stall-after was the one interval the normalization step
-// missed — "--stall-after 007" used to print "stall-after=007s" in the diagnostic even
-// though --poll/--safety-net/--overall-timeout were all already normalized to "7s".
-func TestEwait_StallAfterNormalizedInDiagnostic(t *testing.T) {
-	logPath, cursorPath := newEwaitFiles(t)
-	stub := stubConfig{
-		paneID:      "w1:p1",
-		flipAt:      0, // hits on check-first, before any sleep
-		counterFile: filepath.Join(t.TempDir(), "counter"),
-	}
-	args := []string{
-		"--targets", "w1:p1",
-		"--log", logPath,
-		"--cursor-file", cursorPath,
-		"--poll", "007",
-		"--safety-net", "007",
-		"--overall-timeout", "7",
-		"--stall-after", "007",
-	}
-
-	res := runEwait(t, args, stub, 10*time.Second)
-
-	if res.exitCode != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr: %q", res.exitCode, res.stderr)
-	}
-	if !strings.Contains(res.stderr, "stall-after=7s") {
-		t.Fatalf(`diagnostic should show normalized "stall-after=7s", not "stall-after=007s"; stderr: %q`, res.stderr)
-	}
-	if strings.Contains(res.stderr, "stall-after=007s") {
-		t.Fatalf("diagnostic still shows the unnormalized stall-after value; stderr: %q", res.stderr)
-	}
-}
+// See ewait_diagnostics_test.go for: HERDR_STUB_MAP stub-fidelity tests (round-4, L2),
+// stub success-shape nesting tests (round-5, N2), cursor-file tests (round-5, L2), and
+// the startup-diagnostic tests (round-2 N2, round-3 N5).

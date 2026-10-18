@@ -23,6 +23,23 @@ package main
 // agent and a dead socket. The stub's choice (stderr) is correct as-is; see
 // the round-3 report for the exact commands and byte counts.
 //
+// Round-5 review (#9, N2) re-checked SUCCESS shapes specifically: real herdr nests a
+// success result rather than putting its fields at the top level, which this file's own
+// "deliberately shaped to match REAL herdr" claim above did not actually hold for until
+// this fix — harmless in practice (the script's own greps for "pane_id"/"agent_status"
+// are shape-agnostic, so behavior never depended on the nesting), but worth fixing since
+// a future change that parses structure, or that greps a key appearing at a different
+// nesting depth, would not have been caught. Verified live, read-only, on this machine:
+//   `herdr agent get <pane>` -> {"id":"cli:agent:get","result":{"agent":{...,
+//     "pane_id":"...",...},"type":"agent_info"}}
+//   `herdr pane get <pane>`  -> {"id":"cli:pane:get","result":{"pane":{...,
+//     "agent_status":"...",...,"pane_id":"...",...},"type":"pane_info"}}, including
+//     "agent_status":"unknown" for a real agent-less pane (the stub's pane get success
+//     previously omitted agent_status altogether)
+// Both success shapes below are nested accordingly. $HERDR_STUB_WEIRD_SHAPE is the one
+// deliberate exception — its entire purpose is to simulate an unrecognized response
+// shape (round-3 review, L2), so it stays flat, with no "pane_id" field at all, by design.
+//
 // The stub implements `herdr agent get <target>` and `herdr pane get
 // <target>`:
 //   - if $HERDR_STUB_SERVER_DOWN is set, EVERY call (either subcommand,
@@ -43,7 +60,11 @@ package main
 //     succeeds with agent_status "working" and pane_id == the target
 //     itself (a target that never reaches a terminal state, for the
 //     overall-timeout path, or a resolvable-but-idle target for
-//     diagnostic-only checks);
+//     diagnostic-only checks); if $HERDR_STUB_CONTENT_SEQ is also set, the
+//     response additionally carries a constant "detection_content_seq" —
+//     unchanging across every call, the shape rule 6's working-stall
+//     branch needs to ever fire in a test (round-5 review, L4; real herdr
+//     0.8.2 has no such field at all, so this is stub-only);
 //   - the target in $HERDR_STUB_NOT_YET_DETECTED fails with the SAME
 //     "agent_not_found" (on stderr) for its first $HERDR_STUB_DETECT_AFTER
 //     calls, then falls through to the counter-based branch below, using
@@ -98,6 +119,19 @@ if [ -n "${HERDR_STUB_SERVER_DOWN:-}" ]; then
   exit 1
 fi
 
+server_down_for="${HERDR_STUB_SERVER_DOWN_FOR_CALLS:-}"
+if [ -n "$server_down_for" ]; then
+  sdcf="${HERDR_STUB_SERVER_DOWN_COUNTER_FILE:?missing}"
+  sdn=0
+  if [ -f "$sdcf" ]; then sdn="$(cat "$sdcf")"; fi
+  sdn=$((sdn+1)); printf '%s' "$sdn" > "$sdcf"
+  if [ "$sdn" -le "$server_down_for" ]; then
+    printf '{"id":"cli:%s:%s","error":{"code":"server_not_running","message":"no herdr server is running"}}\n' "$cmd" "$sub" >&2
+    exit 1
+  fi
+  # recovered: fall through to normal processing below
+fi
+
 if [ "$cmd" = "pane" ] && [ "$sub" = "get" ]; then
   pane_not_found=",${HERDR_STUB_PANE_NOT_FOUND:-},"
   case "$pane_not_found" in
@@ -106,7 +140,7 @@ if [ "$cmd" = "pane" ] && [ "$sub" = "get" ]; then
       exit 1
       ;;
   esac
-  printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"%s"},"type":"pane_info"}}\n' "$target"
+  printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"%s","agent_status":"unknown"},"type":"pane_info"}}\n' "$target"
   exit 0
 fi
 
@@ -133,7 +167,12 @@ esac
 always_working=",${HERDR_STUB_ALWAYS_WORKING:-},"
 case "$always_working" in
   *",$target,"*)
-    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "$target"
+    content_seq="${HERDR_STUB_CONTENT_SEQ:-}"
+    if [ -n "$content_seq" ]; then
+      printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"working","detection_content_seq":%s},"type":"agent_info"}}\n' "$target" "$content_seq"
+    else
+      printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"working"},"type":"agent_info"}}\n' "$target"
+    fi
     exit 0
     ;;
 esac
@@ -165,7 +204,7 @@ if [ -n "$map" ]; then
     pane="${entry#*=}"
     if [ "$target" = "$name" ] || [ "$target" = "$pane" ]; then
       IFS="$old_ifs"
-      printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "$pane"
+      printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"working"},"type":"agent_info"}}\n' "$pane"
       exit 0
     fi
   done
@@ -179,9 +218,9 @@ if [ -n "$moved_name" ] && [ "$target" = "$moved_name" ]; then
   if [ -f "$cf" ]; then n="$(cat "$cf")"; fi
   n=$((n+1)); printf '%s' "$n" > "$cf"
   if [ "$n" -eq 1 ]; then
-    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "${HERDR_STUB_MOVED_OLD_PANE:?missing}"
+    printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"working"},"type":"agent_info"}}\n' "${HERDR_STUB_MOVED_OLD_PANE:?missing}"
   else
-    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "${HERDR_STUB_MOVED_NEW_PANE:?missing}"
+    printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"working"},"type":"agent_info"}}\n' "${HERDR_STUB_MOVED_NEW_PANE:?missing}"
   fi
   exit 0
 fi
@@ -193,7 +232,7 @@ if [ -n "$moved_old" ] && [ "$target" = "$moved_old" ]; then
   if [ -f "$cf" ]; then n="$(cat "$cf")"; fi
   n=$((n+1)); printf '%s' "$n" > "$cf"
   if [ "$n" -eq 1 ]; then
-    printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"working"}\n' "$target"
+    printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"working"},"type":"agent_info"}}\n' "$target"
     exit 0
   fi
   printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"},"id":"cli:agent:get"}\n' "$target" >&2
@@ -202,7 +241,7 @@ fi
 
 moved_new="${HERDR_STUB_MOVED_NEW_PANE:-}"
 if [ -n "$moved_new" ] && [ "$target" = "$moved_new" ]; then
-  printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"done"}\n' "$target"
+  printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"done"},"type":"agent_info"}}\n' "$target"
   exit 0
 fi
 
@@ -219,31 +258,34 @@ status="working"
 if [ "$n" -gt "$flip_at" ]; then
   status="done"
 fi
-printf '{"id":"cli:agent:get","pane_id":"%s","agent_status":"%s"}\n' "$pane_id" "$status"
+printf '{"id":"cli:agent:get","result":{"agent":{"pane_id":"%s","agent_status":"%s"},"type":"agent_info"}}\n' "$pane_id" "$status"
 `
 
 // stubConfig configures the fake herdr for one test run. Zero value is valid
 // (no target will ever match a special case, and the default-case branch is
 // simply never reached if the script never calls herdr).
 type stubConfig struct {
-	unresolvable         string // comma-separated targets -> agent_not_found error, exit 1
-	alwaysWorking        string // comma-separated targets -> identity pane_id, "working" forever
-	notYetDetected       string // single target -> agent_not_found for detectAfter calls, then falls through
-	detectAfter          int
-	detectCounterFile    string
-	mapEntries           string // "name1=pane1;name2=pane2" -> mapped pane_id, "working" forever
-	paneID               string
-	flipAt               int
-	counterFile          string
-	omitHerdr            bool   // if true, herdr is absent from PATH entirely
-	serverDown           bool   // if true, every herdr call fails with server_not_running
-	paneNotFound         string // comma-separated targets -> `herdr pane get` fails with pane_not_found
-	weirdShape           string // comma-separated targets -> success (exit 0) with no pane_id field
-	movedName            string // name whose resolution changes pane_id after its first call
-	movedOldPane         string
-	movedNewPane         string
-	movedNameCounterFile string
-	movedOldCounterFile  string
+	unresolvable          string // comma-separated targets -> agent_not_found error, exit 1
+	alwaysWorking         string // comma-separated targets -> identity pane_id, "working" forever
+	contentSeq            string // paired with alwaysWorking: adds a constant detection_content_seq
+	notYetDetected        string // single target -> agent_not_found for detectAfter calls, then falls through
+	detectAfter           int
+	detectCounterFile     string
+	mapEntries            string // "name1=pane1;name2=pane2" -> mapped pane_id, "working" forever
+	paneID                string
+	flipAt                int
+	counterFile           string
+	omitHerdr             bool   // if true, herdr is absent from PATH entirely
+	serverDown            bool   // if true, every herdr call fails with server_not_running
+	paneNotFound          string // comma-separated targets -> `herdr pane get` fails with pane_not_found
+	weirdShape            string // comma-separated targets -> success (exit 0) with no pane_id field
+	movedName             string // name whose resolution changes pane_id after its first call
+	movedOldPane          string
+	movedNewPane          string
+	movedNameCounterFile  string
+	movedOldCounterFile   string
+	serverDownForCalls    int // every call fails with server_not_running for this many calls, then recovers
+	serverDownCounterFile string
 }
 
 func (c stubConfig) env() []string {
@@ -254,6 +296,9 @@ func (c stubConfig) env() []string {
 	}
 	if c.alwaysWorking != "" {
 		set("HERDR_STUB_ALWAYS_WORKING", c.alwaysWorking)
+	}
+	if c.contentSeq != "" {
+		set("HERDR_STUB_CONTENT_SEQ", c.contentSeq)
 	}
 	if c.notYetDetected != "" {
 		set("HERDR_STUB_NOT_YET_DETECTED", c.notYetDetected)
@@ -284,6 +329,10 @@ func (c stubConfig) env() []string {
 		set("HERDR_STUB_MOVED_NAME_COUNTER_FILE", c.movedNameCounterFile)
 		set("HERDR_STUB_MOVED_OLD_COUNTER_FILE", c.movedOldCounterFile)
 	}
+	if c.serverDownForCalls > 0 {
+		set("HERDR_STUB_SERVER_DOWN_FOR_CALLS", strconv.Itoa(c.serverDownForCalls))
+		set("HERDR_STUB_SERVER_DOWN_COUNTER_FILE", c.serverDownCounterFile)
+	}
 	return env
 }
 
@@ -292,7 +341,7 @@ func requireEwaitTools(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("herdr-ewait.sh requires bash/grep/sed, not available on windows")
 	}
-	for _, tool := range []string{"bash", "grep", "sed", "tail", "wc", "tr", "sleep"} {
+	for _, tool := range []string{"bash", "grep", "sed", "tail", "wc", "tr", "sleep", "cut"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not found in PATH: %v", tool, err)
 		}
@@ -356,7 +405,7 @@ func runHerdrStub(t *testing.T, stub stubConfig, args ...string) (stdout, stderr
 // substitution instead of the intended 6.
 func minimalToolsPath(t *testing.T) string {
 	t.Helper()
-	tools := []string{"bash", "grep", "sed", "tail", "wc", "cat", "date", "head", "tr", "sleep"}
+	tools := []string{"bash", "grep", "sed", "tail", "wc", "cat", "date", "head", "tr", "sleep", "cut"}
 	dirSet := map[string]bool{}
 	for _, tool := range tools {
 		p, err := exec.LookPath(tool)
