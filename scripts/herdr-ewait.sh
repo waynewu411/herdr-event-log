@@ -161,6 +161,14 @@
 #     already looks like a pane id is kept as-is (one-time warning), since there is
 #     nothing to resolve either way; a NAME still exits 6, but the message says the
 #     response shape was the problem, not the target.
+#     L5 — resolution is otherwise exactly-once, at startup, which leaves a NAME target
+#     stale after a mid-wait `herdr pane move` (herdr's own docs: a moved pane gets a
+#     new, workspace-qualified pane_id, and the old one stops resolving — a name caller
+#     presumably wants to follow the agent, not the now-dead pane_id). The safety-net
+#     sweep (rule 5) re-resolves the ORIGINAL name, once, the first time its probe of
+#     the current pane_id comes back completely empty — see `reresolve_if_stale` below
+#     for why that specific trigger, not "didn't hit yet", keeps this free in the
+#     healthy case.
 #
 # Rule 9 — validate --poll/--safety-net/--overall-timeout as seconds (#9):
 #   All three are documented as seconds, but nothing enforced that: #9's root cause was a
@@ -633,6 +641,13 @@ done
 
 # Parse "agent_status":"<state>" out of one `herdr agent get <id>` JSON line, grep/sed only.
 # Real observed shape: {"id":"cli:agent:get",...,"agent_status":"working",...,"pane_id":"w1:p1",...}
+# Every call site below guards the invocation with `|| true` (never inside the function
+# itself, matching the parse_* helpers' convention elsewhere in this script): under
+# `set -o pipefail`, a response with no "agent_status" field at all — a legitimate,
+# expected case (a probe miss, or a target that just vanished) — fails this pipeline via
+# `grep`'s no-match exit, which would otherwise kill the whole script via `set -e` on a
+# condition the surrounding code is explicitly designed to treat as "no hit this tick,
+# keep going", not a fatal error (caught by #9 round-3 review's own test additions).
 get_status() {
   local target="$1"
   herdr agent get "$target" 2>/dev/null \
@@ -681,9 +696,37 @@ emit_hit() {
 verify_and_maybe_emit() {
   local pane="$1" orig="$2"
   local status
-  status="$(get_status "$pane")"
+  status="$(get_status "$pane" || true)"
   if [ -n "$status" ] && printf '%s' "$status" | grep -Eq "^($STATES)\$"; then
     emit_hit "$pane" "$status" "$orig"
+    return 0
+  fi
+  return 1
+}
+
+# L5 fix (#9 round-3 review): a NAME target is resolved to a pane_id exactly once, at
+# startup (rule 8). herdr's own docs say a pane moved to another workspace (`herdr pane
+# move`) gets a NEW, workspace-qualified pane_id, and the old one stops resolving for
+# general callers — so a mid-wait move leaves a name caller's TARGET_ARR entry pointing
+# at a pane_id that no longer exists, with no way to notice short of re-asking herdr
+# about the ORIGINAL name. Called only from the safety-net sweep below, and only when
+# that sweep's own probe of the current pane_id came back completely empty (not merely
+# "not in --states yet" — a healthy but still-working pane must never pay for this) AND
+# the target was originally a name, not an identity pane-id caller with nothing to
+# re-resolve. On success, updates TARGET_ARR in place and returns 0 so the caller can
+# retry immediately; this is the ONLY place TARGET_ARR changes after the startup
+# resolution loop.
+reresolve_if_stale() {
+  local i="$1"
+  local orig="${ORIG_TARGET_ARR[$i]}"
+  local current="${TARGET_ARR[$i]}"
+  [ "$orig" = "$current" ] && return 1
+  local resp new_id
+  resp="$(herdr agent get "$orig" 2>&1 || true)"
+  new_id="$(printf '%s' "$resp" | grep -o '"pane_id":"[^"]*"' | head -n1 | sed -E 's/"pane_id":"([^"]*)"/\1/' || true)"
+  if [ -n "$new_id" ] && [ "$new_id" != "$current" ]; then
+    echo "herdr-ewait: note: '$orig' now resolves to pane_id '$new_id' (was '$current') — the pane likely moved; updating and retrying" >&2
+    TARGET_ARR[$i]="$new_id"
     return 0
   fi
   return 1
@@ -819,8 +862,27 @@ while :; do
   if [ $(( NOW_TS - LAST_SAFETY_NET )) -ge "$SAFETY_NET" ]; then
     LAST_SAFETY_NET="$NOW_TS"
     for i in "${!TARGET_ARR[@]}"; do
-      if verify_and_maybe_emit "${TARGET_ARR[$i]}" "${ORIG_TARGET_ARR[$i]}"; then
-        exit 0
+      t="${TARGET_ARR[$i]}"
+      orig="${ORIG_TARGET_ARR[$i]}"
+      status="$(get_status "$t" || true)"
+      if [ -n "$status" ]; then
+        if printf '%s' "$status" | grep -Eq "^($STATES)\$"; then
+          emit_hit "$t" "$status" "$orig"
+          exit 0
+        fi
+        continue
+      fi
+      # L5 fix (#9 round-3 review): the probe came back completely empty (not just "not
+      # in --states yet") for a NAME-originated target — the pane may have moved. One
+      # extra `agent get` of the ORIGINAL name only in this specific case; a healthy
+      # pane-id caller, or a name caller whose probe still succeeds, never pays for it.
+      if [ "$orig" != "$t" ] && reresolve_if_stale "$i"; then
+        t="${TARGET_ARR[$i]}"
+        status="$(get_status "$t" || true)"
+        if [ -n "$status" ] && printf '%s' "$status" | grep -Eq "^($STATES)\$"; then
+          emit_hit "$t" "$status" "$orig"
+          exit 0
+        fi
       fi
     done
   fi
