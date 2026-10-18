@@ -183,13 +183,30 @@ scripts/herdr-ewait.sh \
   --safety-net 60
 ```
 
-- `--targets` is a comma-separated list of `pane_id`s to watch.
+- `--targets` is a comma-separated list of targets to watch. Each entry can be
+  anything `herdr agent get` accepts — a `pane_id`, an agent name, or a label
+  — and is resolved to its canonical `pane_id` once, at startup, before any
+  waiting begins (the log only ever carries `pane_id`, never a name, so this
+  is what makes a name/label target work with the log-detection path at all).
+  A target that doesn't resolve exits immediately with code `6` rather than
+  starting a waiter that can never match.
 - `--states` is a `|`-separated regex of statuses to accept; the default is
   `blocked|done|idle`.
 - `--log` is the per-instance event log described above.
 - `--cursor-file` persists the byte cursor across calls.
-- `--overall-timeout`, `--poll`, and `--safety-net` tune the total wait, the
-  bounded read interval, and the periodic verification sweep.
+- `--overall-timeout`, `--poll`, and `--safety-net` are all in **seconds**
+  (never milliseconds) and tune the total wait, the bounded read interval,
+  and the periodic verification sweep. Each must be a positive integer;
+  `--poll` must not exceed `--safety-net`, which must not exceed
+  `--overall-timeout`; and `--poll`/`--safety-net` must not exceed 300s — a
+  larger value (e.g. `10000`) almost always means milliseconds were passed by
+  mistake. Any violation is a usage error (exit `4`).
+
+On startup, once targets are resolved, the script prints one diagnostic line
+to stderr: the resolved pane ids, `--states`, `--poll`/`--safety-net`/
+`--overall-timeout` in seconds, and the starting cursor — so a misconfigured
+waiter is visible in the caller's own output immediately, not only as
+unexplained silence hours later.
 
 On success stdout is exactly one compact JSON line:
 
@@ -197,9 +214,12 @@ On success stdout is exactly one compact JSON line:
 {"pane_id":"w3:p2","verified_state":"done","ts":"2026-08-15T00:00:00Z"}
 ```
 
-Exit codes are `0` for a verified hit, `2` for overall timeout, `3` when the
-log is missing/unreadable at start (the caller can fall back to the degraded
-`herdr agent wait` path), and `4` for a usage error.
+Exit codes: `0` for a verified hit, `2` for overall timeout, `3` when the log
+is missing/unreadable at start (the caller can fall back to the degraded
+`herdr agent wait` path), `4` for a usage error (bad flags, invalid
+`--states`, or an invalid/out-of-range `--poll`/`--safety-net`/
+`--overall-timeout`), `5` for a suspected stall (only with `--stall-after`
+set), and `6` when a `--targets` entry could not be resolved to a `pane_id`.
 
 Log matches are wake-up signals, not truth: every candidate hit and every
 periodic safety-net sweep is re-checked against `herdr agent get`, so a stale
@@ -228,7 +248,11 @@ make clean   # remove the built binary
 - the `O_APPEND` + single-`write()` atomicity assumption the design relies
   on — spawns many real child OS processes (not goroutines) that all
   invoke the built hook binary concurrently against the same log file, then
-  asserts every line is present, valid JSON, and not merged/truncated.
+  asserts every line is present, valid JSON, and not merged/truncated;
+- `scripts/herdr-ewait.sh` itself — run as a real `bash` subprocess against a
+  fake `herdr` CLI stub on `PATH`, covering name-to-`pane_id` resolution, an
+  unresolvable target (exit `6`), every invalid-interval case (exit `4`), and
+  the check-first/log-hit/safety-net-hit/overall-timeout paths.
 
 None of this requires a live Herdr session. A GitHub Actions workflow
 (`.github/workflows/test.yml`) runs `make fmt`, `make vet`, `make build`, and
