@@ -41,8 +41,9 @@
 #   2  overall timeout reached with no verified hit
 #   3  log file missing/unreadable at start (caller should fall back to the
 #      degraded `herdr agent wait` path — see references/supervision.md)
-#   4  usage error (bad/missing flag, an invalid --states token, or an invalid/out-of-range
-#      --poll, --safety-net or --overall-timeout — see rule 9 below)
+#   4  usage error (bad/missing flag, an invalid --states token, an invalid/out-of-range
+#      --poll/--safety-net/--overall-timeout — see rule 9 below — or an unwritable
+#      --cursor-file once a run actually needs to persist one)
 #   5  suspected stall (only possible when --stall-after > 0; see rule 6 below), one of:
 #        - a target's `detection_content_seq` has not moved across two bracketing
 #          `--stall-after` checks (so at least one full window, confirmed by TWO
@@ -65,10 +66,13 @@
 #      `--stall-after` well under a THIRD of `--overall-timeout` accordingly (the shipped
 #      default, 600s vs. a 3600s timeout, has ~6x headroom).
 #   6  a --targets entry could not be resolved to a pane_id at startup — an unresolvable
-#      name, a pane id that does not exist (confirmed via `herdr pane get`, not just a
-#      guess — see rule 8 below), or herdr itself unreachable (NOT a pane id that exists
-#      but whose agent herdr simply hasn't classified yet, and NOT an empty entry — those
-#      are dropped silently; an all-empty --targets is a usage error, exit 4). The waiter
+#      NAME (including when herdr itself is unreachable — a name has no fallback
+#      identity), or a pane id that does not exist (confirmed via `herdr pane get`, not
+#      just a guess — see rule 8 below). (NOT a pane id that exists but whose agent herdr
+#      simply hasn't classified yet; NOT a pane id when herdr is only TEMPORARILY
+#      unreachable — round-5 review, L3: ridden out instead, same as `main`, since a pane
+#      id has nothing to resolve either way; and NOT an empty entry — those are dropped
+#      silently; an all-empty --targets is a usage error, exit 4.) The waiter
 #      never starts rather than watching a filter that can never match.
 #
 # Five hardening rules (each numbered comment below fixes a live #820 bug):
@@ -96,6 +100,13 @@
 #   Comparing across a `--stall-after` window lets the target's *direct parent* — the only
 #   party allowed to look at it at all — detect a real stall without a skip-level `pane
 #   read` of a grandchild, and without waiting out the full `--overall-timeout` to find out.
+#   L1 fix (#9 round-5 review): a probe-miss tick here now gives a NAME-originated target
+#   the same one-shot re-resolve the safety-net sweep (rule 5) uses, via the shared
+#   `reresolve_if_stale` helper, BEFORE counting the miss toward an outage window. Without
+#   it, a mid-wait `herdr pane move` made the OLD pane_id probed here permanently
+#   unreachable — not a flapping probe, a dead one — which this rule would otherwise (and
+#   wrongly) report as exit 5 "may no longer exist" well before the safety-net sweep (which
+#   could be running on a longer interval) got a chance to notice the move itself.
 #
 # Rule 7 — --states separator normalization (#903, fixes a live #898 bug):
 #   Both grep call sites below splice $STATES verbatim into an ERE alternation
@@ -179,7 +190,10 @@
 #   caller passing millisecond-sized values (10000/30000/2400000) for second-based flags —
 #   --poll became a ~2h47m `sleep`, and --safety-net a sweep every ~8h20m, both inside a
 #   script whose whole job is to wake up promptly. Rule 9 rejects, as a usage error (exit 4):
-#   any of the three non-numeric or <= 0; --poll greater than --safety-net, or --safety-net
+#   any of the three non-numeric or negative; --poll/--safety-net also when exactly 0
+#   (--overall-timeout 0 is exempt — a pre-existing, meaningful idiom, see N2 below — round-5
+#   review, N3: this line previously said "non-numeric or <= 0" for all three, which the N2
+#   paragraph and the code both contradict); --poll greater than --safety-net, or --safety-net
 #   greater than --overall-timeout (an inversion that can only ever delay detection); and
 #   --poll or --safety-net above INTERVAL_CEILING_S (a named constant, not a magic number —
 #   see below), whose error names the millisecond-vs-second mistake directly, since a
@@ -286,9 +300,12 @@ REQUIRED:
   --targets "id1,id2"   Comma-separated targets to watch — each one a pane id OR a unique
                         live agent name (whatever `herdr agent get` itself accepts; it does
                         NOT accept a bare label). Every entry is resolved to its pane_id at
-                        startup (rule 8); an entry that genuinely can't be resolved (unknown
-                        name, nonexistent pane id, herdr unreachable) exits 6 immediately,
-                        before any waiting begins. An empty entry (from a doubled or
+                        startup (rule 8); an entry that genuinely can't be resolved (an
+                        unknown name — including when herdr itself is unreachable — or a
+                        nonexistent pane id) exits 6 immediately, before any waiting
+                        begins. A pane id target rides out herdr being only TEMPORARILY
+                        unreachable instead (same as `main`), since it has nothing to
+                        resolve either way. An empty entry (from a doubled or
                         trailing comma) is dropped, not resolved — an all-empty --targets
                         is a usage error, exit 4. A pane id that DOES exist but whose agent
                         herdr hasn't classified yet is kept as-is, not rejected — see
@@ -345,13 +362,16 @@ EXIT CODES:
   2  overall timeout reached with no verified hit
   3  log file missing/unreadable at start (caller falls back to `herdr agent wait`)
   4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
-     an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9 — or
-     a --targets with no non-empty entries left after dropping doubled/trailing commas)
+     an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9 — a
+     --targets with no non-empty entries left after dropping doubled/trailing commas, or
+     an unwritable --cursor-file once a run actually needs to persist one — never for a
+     run whose check-first already hits, exit 0, same as `main`)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
-  6  a --targets entry could not be resolved to a pane_id — an unresolvable name, a
-     nonexistent pane id, or herdr unreachable (NOT a pane id that exists but whose
-     agent herdr hasn't classified yet, and NOT an empty entry — see rule 8 and
-     --targets above)
+  6  a --targets entry could not be resolved to a pane_id — an unresolvable name
+     (including when herdr itself is unreachable), or a nonexistent pane id (NOT a
+     pane id that exists but whose agent hasn't classified yet; NOT a pane id when
+     herdr is only temporarily unreachable — ridden out instead, same as `main`; and
+     NOT an empty entry — see rule 8 and --targets above)
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
   hit (exit 0):    {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>","target":"..."}
@@ -651,6 +671,24 @@ for i in "${!TARGET_ARR[@]}"; do
     exit 6
   fi
 
+  # L3 fix (#9 round-5 review): on `main`, a pane-id caller had nothing to resolve in the
+  # first place, so it rode out a transient herdr outage at startup for free — every
+  # probe elsewhere in this script is unconditionally tolerant (`|| true`) of herdr being
+  # briefly unreachable. Resolution introduced a NEW hard failure for exactly this case,
+  # since this generic fallback previously exited 6 unconditionally. Issue 9 never asked
+  # to fail closed on "herdr itself is down" for a target that already IS a pane id —
+  # only a genuinely bad target should. A NAME still exits 6 here: it has no identity to
+  # fall back on, and retrying the resolution call itself is a bigger change than this
+  # fix warrants.
+  if [[ "$t" =~ $PANE_ID_RE ]]; then
+    if [ -n "$code" ]; then
+      echo "herdr-ewait: warning: 'herdr agent get $t' failed ($code) — herdr itself may be temporarily unreachable; using '$t' as-is and continuing to wait" >&2
+    else
+      echo "herdr-ewait: warning: 'herdr agent get $t' produced no usable response — herdr itself may be temporarily unreachable; using '$t' as-is and continuing to wait" >&2
+    fi
+    continue
+  fi
+
   if [ -n "$code" ]; then
     echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' ($code)" >&2
   else
@@ -661,8 +699,11 @@ for i in "${!TARGET_ARR[@]}"; do
     # looking for a bad target name even when the real cause is, say, no herdr on PATH
     # at all. Surface the first non-blank line of the captured output (trimmed,
     # length-capped so one giant stack trace can't flood stderr) when there is one.
+    # N1 fix (#9 round-5 review): `|| true` on the `cut` stage too — a missing/failed
+    # `cut` on a split-tools PATH must degrade to the no-detail message below, not kill
+    # the script via `set -e`/`pipefail` on what is already a failure-reporting path.
     raw_line="$(printf '%s' "$RESOLVE_RESP" | grep -m1 -v '^[[:space:]]*$' || true)"
-    raw_line="$(printf '%s' "$raw_line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160)"
+    raw_line="$(printf '%s' "$raw_line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160 || true)"
     if [ -n "$raw_line" ]; then
       echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (unknown target, pane gone, or herdr unreachable — herdr said: \"$raw_line\")" >&2
     else
@@ -768,25 +809,27 @@ reresolve_if_stale() {
   return 1
 }
 
-# Establish/resume the byte cursor. Note (N1, #9 round-3 review): this now runs BEFORE
-# check-first (moved there so the startup diagnostic below can include the cursor — see
-# round-2's N2 nit) rather than after, as it was on `main` and in round 1. The observable
-# effect: a run that hits immediately on check-first now still leaves a cursor file
-# behind, which it never did before. Outcome-neutral for this script's own behavior (a
-# later resumed run just replays a few already-verified log lines that verify-on-hit
-# re-checks and discards), but worth knowing if some OTHER tool treats "no cursor file"
-# as a proxy for "this waiter never started".
+# Establish (but do not yet persist) the byte cursor. Note (N1, #9 round-3 review): the
+# VALUE is computed here, before check-first, so the startup diagnostic below can include
+# it (round-2's N2 nit) — but the write-to-disk is deliberately NOT done here. Round-5
+# review (L2): a FRESH cursor file used to be written at this exact point, which on `main`
+# only ran AFTER check-first; an unwritable --cursor-file path then crashed under `set -e`
+# with a raw bash error (undocumented exit 1) even when the target was already terminal —
+# losing a hit `main` would have reported with exit 0. The write is restored to its
+# original, post-check-first position below (CURSOR_IS_FRESH records which branch this
+# was, since the "already exists" branch never writes at all, matching `main`).
 if [ -f "$CURSOR_FILE" ]; then
   CURSOR="$(cat "$CURSOR_FILE" 2>/dev/null || echo 0)"
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
+  CURSOR_IS_FRESH=0
 else
   # F1: a fresh waiter has no interest in history — check-first (below) already covers
   # "the target is already settled". Starting at 0 would replay the entire session log
   # on tick one, spending one spurious `agent get` per stale pre-filter match. Start at
-  # the log's CURRENT size instead, and persist it immediately.
+  # the log's CURRENT size instead; persisted after check-first, below.
   CURSOR="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ' || true)"
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
-  printf '%s' "$CURSOR" > "$CURSOR_FILE"
+  CURSOR_IS_FRESH=1
 fi
 
 # Startup diagnostic (#9, round-1/round-2 fixes): print exactly what this run resolved
@@ -817,6 +860,17 @@ for i in "${!TARGET_ARR[@]}"; do
     exit 0
   fi
 done
+
+# L2 fix (#9 round-5 review): persist a FRESH cursor only now, after check-first — same
+# position as `main` — so an immediate hit above is never lost to a bad --cursor-file
+# path. Guarded (rather than left to crash under `set -e`) so an unwritable path is a
+# documented usage error, not a raw bash error with an undocumented exit code.
+if [ "$CURSOR_IS_FRESH" -eq 1 ]; then
+  printf '%s' "$CURSOR" > "$CURSOR_FILE" || {
+    echo "herdr-ewait: cannot write cursor file: $CURSOR_FILE" >&2
+    exit 4
+  }
+fi
 
 START_TS=$(date +%s)
 LAST_SAFETY_NET=$START_TS
@@ -959,6 +1013,34 @@ while :; do
           fi
           continue
         fi
+
+        # L1 fix (#9 round-5 review): before counting this as a genuine outage tick, give
+        # a NAME-originated target (never a pane-id caller — reresolve_if_stale itself
+        # also checks this) one chance to re-resolve, the same trigger the safety-net
+        # sweep uses. Without this, a mid-wait `herdr pane move` would count every probe
+        # of the now-permanently-dead old pane_id toward "unreachable for a full window"
+        # and could exit 5 claiming the pane "may no longer exist" while the agent is
+        # alive under its new pane_id — a false stall this rule exists to avoid, not cause.
+        if [ "${ORIG_TARGET_ARR[$i]}" != "$t" ] && reresolve_if_stale "$i"; then
+          t="${TARGET_ARR[$i]}"
+          RESP="$(herdr agent get "$t" 2>/dev/null || true)"
+          seq="$(parse_content_seq "$RESP" || true)"
+          status="$(parse_agent_status "$RESP" || true)"
+          if [ -n "$seq" ] || [ -n "$status" ]; then
+            # Reachable again under the new pane_id. Re-baseline rather than carry the old
+            # pane_id's seq/working-bracket state forward — that baseline belongs to a
+            # pane_id that no longer exists; the next tick resumes stall detection fresh
+            # against the new one.
+            STALL_MISS_SINCE_ARR[$i]=""
+            STALL_SEQ_ARR[$i]="$seq"
+            STALL_TS_ARR[$i]=$NOW_TS
+            STALL_PREV_WORKING_ARR[$i]=""
+            continue
+          fi
+          # Still unreachable even under the freshly re-resolved pane_id — fall through to
+          # the normal miss-timer handling below, now against the new pane_id.
+        fi
+
         miss_since="${STALL_MISS_SINCE_ARR[$i]:-}"
         if [ -z "$miss_since" ]; then
           # First tick of a genuine outage — start timing it; don't report yet.
