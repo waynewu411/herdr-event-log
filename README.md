@@ -204,27 +204,38 @@ scripts/herdr-ewait.sh \
 - `--cursor-file` persists the byte cursor across calls.
 - `--overall-timeout`, `--poll`, and `--safety-net` are all in **seconds**
   (never milliseconds) and tune the total wait, the bounded read interval,
-  and the periodic verification sweep. Each must be a positive integer;
+  and the periodic verification sweep. `--poll`/`--safety-net` must be a
+  positive integer `<= 300s`; `--overall-timeout` must be `0` (see below) or
+  a positive integer `<= 86400s` (24h). A value past either ceiling (e.g.
+  `10000`, or `2400000`) almost always means milliseconds were passed by
+  mistake, and the error says so — checked **before** the ordering rule
+  below, so it fires regardless of what the other flags happen to be.
   `--poll` must not exceed `--safety-net`, which must not exceed
-  `--overall-timeout`; and `--poll`/`--safety-net` must not exceed 300s — a
-  larger value (e.g. `10000`) almost always means milliseconds were passed by
-  mistake. These checks only bind a flag you actually pass: an **omitted**
-  `--poll`/`--safety-net` is clamped down to fit an explicit
+  `--overall-timeout` (skipped entirely when `--overall-timeout` is `0`,
+  since nothing in that case ever uses them — see below). These
+  ordering/ceiling checks only bind a flag you actually pass: an **omitted**
+  `--poll`/`--safety-net` is clamped down to fit an explicit, nonzero
   `--overall-timeout` instead of being rejected, so e.g.
   `--overall-timeout 30` alone stays valid exactly as before this validation
   existed. **This only applies to an omitted flag** — the example above
   passes all three explicitly, so shortening just `--overall-timeout` in a
   copy of it (without also dropping `--poll`/`--safety-net`) is a genuine
   ordering violation, not something the clamp repairs; the error message
-  says so. Any other violation is a usage error (exit `4`).
+  says so. `--overall-timeout 0` is a special, pre-existing case: "probe
+  once (check-first), then give up immediately" (exit `2`) — it predates all
+  of this validation and keeps working exactly as before. Any other
+  violation is a usage error (exit `4`).
 
 On startup, once targets are resolved, the script prints one diagnostic line
 to stderr — **before** check-first, so it prints even on a run that hits
-immediately: each target as `original=resolved` (e.g. `alice=w7:p3`),
-`--states`, `--poll`/`--safety-net`/`--overall-timeout`/`--stall-after` in
-seconds (after any clamping above), and the starting cursor — so a
-misconfigured waiter is visible in the caller's own output immediately, not
-only as unexplained silence hours later.
+immediately (this does mean a cursor file is now created even on an
+immediate hit, where it previously wasn't — harmless for this script's own
+behavior, but worth knowing if some other tool treats "no cursor file" as a
+proxy for "never started"): each target as `original=resolved` (e.g.
+`alice=w7:p3`), `--states`, `--poll`/`--safety-net`/`--overall-timeout`/
+`--stall-after` in seconds (after any clamping above), and the starting
+cursor — so a misconfigured waiter is visible in the caller's own output
+immediately, not only as unexplained silence hours later.
 
 On success stdout is exactly one compact JSON line:
 
@@ -247,7 +258,16 @@ is missing/unreadable at start (the caller can fall back to the degraded
 set), and `6` when a `--targets` entry could not be resolved to a `pane_id`
 (an unresolvable name, a nonexistent `pane_id`, an empty entry, or herdr
 unreachable — not a `pane_id` that exists but whose agent simply hasn't been
-classified yet).
+classified yet). The exit-`6` message includes herdr's own error code when
+one was returned (e.g. `agent_not_found`, `pane_not_found`,
+`server_not_running`); for a non-JSON failure (herdr absent entirely, a
+shell-level error) it instead quotes whatever text was actually printed,
+rather than a generic guess. If herdr instead returns **success** with a
+response that just doesn't contain a recognizable `pane_id` (an unexpected
+or future-renamed shape, not a failure herdr itself reported), a `pane_id`
+target is kept as-is with a warning — the same posture as the
+detection-lag case above — while a name target still exits `6`, with a
+message that says the response shape was the problem, not the target.
 
 Log matches are wake-up signals, not truth: every candidate hit and every
 periodic safety-net sweep is re-checked against `herdr agent get`, so a stale
@@ -280,18 +300,26 @@ make clean   # remove the built binary
 - `scripts/herdr-ewait.sh` itself — run as a real `bash` subprocess against a
   fake `herdr` CLI stub on `PATH` whose success/error shapes (including which
   stream each goes to) were verified live and read-only against real herdr
-  before being written, covering: name-to-`pane_id` resolution (with the
-  hit/stall `"target"` field and the startup diagnostic's mapping verified),
-  a `pane_id` whose agent herdr hasn't classified yet but whose *pane* herdr
-  confirms exists (kept as-is, not rejected) versus a `pane_id` that does not
-  exist at all (exit `6`, never waited out), an unresolvable name including
-  when herdr itself is unreachable or its socket is down (exit `6` with
-  herdr's own error code), an empty `--targets` entry (skipped, not fatal),
-  every invalid-interval case — including the exact 300s ceiling boundary,
-  and an omitted `--poll`/`--safety-net` being clamped to fit a short
-  explicit `--overall-timeout` rather than rejected, while passing all three
-  explicitly and then shortening only `--overall-timeout` still correctly
-  errors — and the check-first/log-hit/safety-net-hit/overall-timeout paths.
+  before being written (re-checked each review round, including one claim
+  that did **not** reproduce — see the script header's note on
+  `server_not_running`), covering: name-to-`pane_id` resolution (with the
+  hit/stall `"target"` field, the startup diagnostic's mapping, and the hit
+  line's JSON validity all verified), a `pane_id` whose agent herdr hasn't
+  classified yet but whose *pane* herdr confirms exists (kept as-is, not
+  rejected) versus a `pane_id` that does not exist at all (exit `6`, never
+  waited out), a herdr *success* response with an unexpected shape (kept
+  as-is for a `pane_id` target, exit `6` with an accurate message for a
+  name), an unresolvable name including when herdr itself is unreachable or
+  its socket is down (exit `6` with herdr's own error code, or the raw
+  failure text when there is no code to surface), an empty `--targets` entry
+  (skipped, not fatal), every invalid-interval case — including the exact
+  300s/24h ceiling boundaries, the millisecond hint firing regardless of
+  which single flag is set, `--overall-timeout 0`'s pre-existing "probe
+  once" idiom staying valid, and an omitted `--poll`/`--safety-net` being
+  clamped to fit a short explicit `--overall-timeout` rather than rejected,
+  while passing all three explicitly and then shortening only
+  `--overall-timeout` still correctly errors — and the
+  check-first/log-hit/safety-net-hit/overall-timeout paths.
 
 None of this requires a live Herdr session. A GitHub Actions workflow
 (`.github/workflows/test.yml`) runs `make fmt`, `make vet`, `make build`, and
