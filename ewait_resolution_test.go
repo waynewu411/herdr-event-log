@@ -576,6 +576,27 @@ func TestEwait_AllEmptyTargetsEntries_UsageError(t *testing.T) {
 	}
 }
 
+// N3: a target entry starting with "-" (e.g. a bare "-h"/"--help" typo'd into
+// --targets) can never be a pane id or a herdr name ([a-z][a-z0-9_-]{0,31}), so it is
+// rejected as a usage error before resolution rather than sent to `herdr agent get`
+// (where real herdr treats "-h"/"--help" specially — printing its own help and exiting
+// 0 — rather than failing closed the way every other bad target does).
+func TestEwait_TargetStartingWithDash_UsageError(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+
+	args := []string{
+		"--targets", "-h",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stubConfig{}, 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit code = %d, want 4 (usage error, before ever calling herdr); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
 // --- M1: the startup diagnostic lists every target's name=pane_id mapping ---
 
 func TestEwait_TwoResolvableTargets_DiagnosticListsBothMappings(t *testing.T) {

@@ -460,6 +460,7 @@ func startEwait(t *testing.T, args []string, stub stubConfig) *ewaitProcess {
 
 	cmd := exec.Command("bash", append([]string{scriptPath}, args...)...)
 	cmd.Env = append(stub.env(), "PATH="+pathEnv)
+	setNewProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -488,7 +489,7 @@ func (p *ewaitProcess) wait(t *testing.T, timeout time.Duration) ewaitResult {
 		}
 		return ewaitResult{stdout: p.stdout.String(), stderr: p.stderr.String(), exitCode: code}
 	case <-time.After(timeout):
-		_ = p.cmd.Process.Kill()
+		killProcessGroup(p.cmd)
 		<-p.done
 		t.Fatalf("herdr-ewait.sh did not exit within %s (stdout: %q, stderr: %q)", timeout, p.stdout.String(), p.stderr.String())
 		return ewaitResult{}
@@ -570,5 +571,35 @@ func assertSingleJSONLine(t *testing.T, stdout string) {
 	var v map[string]any
 	if err := json.Unmarshal([]byte(trimmed), &v); err != nil {
 		t.Fatalf("stdout is not valid JSON: %v; got: %q", err, stdout)
+	}
+}
+
+// A timed-out wait() kills the whole process group, not just the direct bash child —
+// otherwise an orphaned `sleep "$POLL"` keeps the subprocess's stdout/stderr pipes open
+// and cmd.Wait() blocks for however long that child has left to run, turning a hung
+// script into a slow test failure (or, against a long enough --poll, a Go test binary
+// timeout) instead of a fast one. Exercises killProcessGroup directly rather than through
+// wait() itself, since wait()'s timeout path calls t.Fatalf by design.
+func TestEwaitProcess_KillOnTimeout_KillsWholeProcessGroup(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	stub := stubConfig{alwaysWorking: "w1:p1"} // never reaches a terminal state
+	args := []string{
+		"--targets", "w1:p1",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "8", // long enough that leaking it would clearly fail the bound below
+		"--overall-timeout", "60",
+	}
+
+	p := startEwait(t, args, stub)
+	time.Sleep(300 * time.Millisecond) // let the script get past startup and into `sleep "$POLL"`
+
+	start := time.Now()
+	killProcessGroup(p.cmd)
+	<-p.done
+	elapsed := time.Since(start)
+
+	if elapsed > 3*time.Second {
+		t.Fatalf("killing the process group took %s; an orphaned sleep must die with the script, not keep cmd.Wait blocked for its own remaining duration", elapsed)
 	}
 }

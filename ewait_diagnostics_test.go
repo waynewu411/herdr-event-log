@@ -196,6 +196,41 @@ func TestEwait_UnwritableCursorFile_NonImmediateRun_ExitsFourNotRawError(t *test
 	}
 }
 
+// The fresh-cursor write above is guarded; the resume-path write inside the main loop
+// (an existing --cursor-file that later becomes unwritable) must behave the same way,
+// since --help/the header/README all document exit 4 for an unwritable --cursor-file
+// without distinguishing fresh from resumed.
+func TestEwait_ExistingCursorFileTurnsUnwritable_ExitsFourNotRawError(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+	if err := os.WriteFile(cursorPath, []byte("0"), 0o444); err != nil {
+		t.Fatalf("seed read-only cursor file: %v", err)
+	}
+	// alwaysWorking never reaches a terminal state, so check-first does not hit and the
+	// run reaches the main loop, which only tries to persist the cursor once the log
+	// actually grows past it.
+	stub := stubConfig{alwaysWorking: "w1:p1"}
+	args := []string{
+		"--targets", "w1:p1",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--poll", "1",
+		"--overall-timeout", "10",
+	}
+
+	p := startEwait(t, args, stub)
+	time.Sleep(300 * time.Millisecond) // let resolution/check-first/the first tick pass
+	appendLine(t, logPath, `{"ts":"2026-10-18T00:00:00Z","pane_id":"unrelated","agent_status":"done"}`)
+
+	res := p.wait(t, 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit code = %d, want 4 (a documented usage error, not a raw bash crash); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "cursor") {
+		t.Fatalf("error should name the cursor file as the problem; stderr: %q", res.stderr)
+	}
+}
+
 // --- N2 (round 2): the startup diagnostic prints even when check-first hits immediately ---
 
 func TestEwait_DiagnosticPrintedEvenOnImmediateHit(t *testing.T) {
