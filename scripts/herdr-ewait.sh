@@ -12,6 +12,11 @@
 #                   [--stall-after 0]
 #   herdr-ewait.sh --help    # full usage to stdout, exit 0
 #
+# --targets accepts, per entry, anything `herdr agent get` accepts: a pane id, an agent
+# name, or a label (see rule 8 below) — each is resolved to a pane_id at startup.
+# --overall-timeout, --poll and --safety-net are all in SECONDS, not milliseconds
+# (see rule 9 below).
+#
 # Stdout on success (exit 0): exactly one compact JSON line, nothing else:
 #   {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>"}
 # (Exception: --help/-h also exits 0 but prints human-readable help to stdout, NOT a JSON hit
@@ -27,7 +32,8 @@
 #   2  overall timeout reached with no verified hit
 #   3  log file missing/unreadable at start (caller should fall back to the
 #      degraded `herdr agent wait` path — see references/supervision.md)
-#   4  usage error
+#   4  usage error (bad/missing flag, an invalid --states token, or an invalid/out-of-range
+#      --poll, --safety-net or --overall-timeout — see rule 9 below)
 #   5  suspected stall (only possible when --stall-after > 0; see rule 6 below), one of:
 #        - a target's `detection_content_seq` has not moved across two bracketing
 #          `--stall-after` checks (so at least one full window, confirmed by TWO
@@ -49,6 +55,9 @@
 #      `--stall-after` (~2x for a target already stalled when the wait starts). Size
 #      `--stall-after` well under a THIRD of `--overall-timeout` accordingly (the shipped
 #      default, 600s vs. a 3600s timeout, has ~6x headroom).
+#   6  a --targets entry could not be resolved to a pane_id via `herdr agent get` at
+#      startup (unknown target, pane gone, or herdr itself unreachable) — see rule 8
+#      below. The waiter never starts rather than watching a filter that can never match.
 #
 # Five hardening rules (each numbered comment below fixes a live #820 bug):
 #   1. check-first        4. verify-on-hit
@@ -88,6 +97,32 @@
 #   canonicalized to a pipe alternation, and every token is validated against the three real
 #   states — an unknown token, or a value with no real state at all, is now a loud usage error
 #   (exit 4), never a silent no-op filter.
+#
+# Rule 8 — resolve every target to a pane_id at startup (#9):
+#   The log pre-filter (both this rule's grep call sites and the one above) matches only
+#   `"pane_id":"<id>"` — event lines carry a pane_id, never an agent name or label. A caller
+#   that passes a NAME (herdr's `agent get` accepts a pane id, a name, or a label) silently
+#   loses the entire log-detection path (rules 1, 4, 5, the pre-filter): only --safety-net
+#   can ever fire, and only once --safety-net has elapsed. #9 observed exactly this —
+#   two waiters configured by name sat for 4 and 9 real minutes after their targets
+#   finished, invisible until a 30000s safety-net (itself a unit mistake, see rule 9) that
+#   never came. Rule 8 resolves every --targets entry to its canonical pane_id via one
+#   `herdr agent get` call at startup, before any waiting begins, and uses that pane_id for
+#   every subsequent call (log filter and live verification alike). A target that does not
+#   resolve — unknown, pane gone, or herdr itself unreachable — exits 6 immediately: this
+#   script never starts a waiter watching a filter that can never match.
+#
+# Rule 9 — validate --poll/--safety-net/--overall-timeout as seconds (#9):
+#   All three are documented as seconds, but nothing enforced that: #9's root cause was a
+#   caller passing millisecond-sized values (10000/30000/2400000) for second-based flags —
+#   --poll became a ~2h47m `sleep`, and --safety-net a sweep every ~8h20m, both inside a
+#   script whose whole job is to wake up promptly. Rule 9 rejects, as a usage error (exit 4):
+#   any of the three non-numeric or <= 0; --poll greater than --safety-net, or --safety-net
+#   greater than --overall-timeout (an inversion that can only ever delay detection); and
+#   --poll or --safety-net above INTERVAL_CEILING_S (a named constant, not a magic number —
+#   see below), whose error names the millisecond-vs-second mistake directly, since a
+#   five-digit-or-larger value for either flag is far more likely to be milliseconds than a
+#   genuine multi-minute poll/safety-net interval.
 
 set -euo pipefail
 
@@ -99,6 +134,7 @@ OVERALL_TIMEOUT=3600
 POLL=5
 SAFETY_NET=60
 STALL_AFTER=0   # rule 6: opt-in; 0 = disabled, fully backward compatible
+readonly INTERVAL_CEILING_S=300   # rule 9: named ceiling for --poll/--safety-net, in seconds
 
 usage() {
   echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N] [--stall-after N]" >&2
@@ -121,7 +157,11 @@ USAGE:
   herdr-ewait.sh --help
 
 REQUIRED:
-  --targets "id1,id2"   Comma-separated pane ids to watch. Wakes on whichever moves first.
+  --targets "id1,id2"   Comma-separated targets to watch — each one anything `herdr agent
+                        get` accepts: a pane id, an agent name, or a label. Every entry is
+                        resolved to its pane_id at startup (rule 8); an entry that doesn't
+                        resolve exits 6 immediately, before any waiting begins. Wakes on
+                        whichever target moves first.
   --log <file>          The herdr-event-log file (the event bus) to consume.
   --cursor-file <file>  This waiter's own byte-cursor file (independent per consumer).
 
@@ -134,20 +174,29 @@ OPTIONAL:
                         with no real state at all, is a usage error (exit 4) — never a
                         silent no-op filter. Prefer omitting this unless you genuinely need
                         to NARROW the set — the default already covers blocked|done|idle.
-  --overall-timeout N   Max seconds to wait before giving up. Default: 3600.
-  --poll N              Seconds between log-cursor polls. Default: 5.
-  --safety-net N        Seconds between unconditional live `agent get` sweeps. Default: 60.
+  --overall-timeout N   Max SECONDS to wait before giving up. Default: 3600.
+  --poll N              SECONDS between log-cursor polls. Default: 5. Must be <=
+                        --safety-net and <= INTERVAL_CEILING_S (300).
+  --safety-net N        SECONDS between unconditional live `agent get` sweeps. Default: 60.
+                        Must be <= --overall-timeout and <= INTERVAL_CEILING_S (300).
   --stall-after N       Opt-in working-stall detection window in seconds. Default: 0 (off).
                         Size it well under a third of --overall-timeout (see header, rule 6).
   --help, -h            Print this help to stdout and exit 0.
+
+  --poll, --safety-net and --overall-timeout are all SECONDS, never milliseconds (rule 9).
+  Each must be a positive integer; --poll must not exceed --safety-net, which must not
+  exceed --overall-timeout; and --poll/--safety-net must not exceed 300s — a larger value
+  (e.g. 10000) almost always means the caller passed milliseconds by mistake.
 
 EXIT CODES:
   0  hit — a target reached one of --states, verified live by `herdr agent get`
      (also exit 0 for --help/-h, which prints this help to stdout instead of a hit JSON line)
   2  overall timeout reached with no verified hit
   3  log file missing/unreadable at start (caller falls back to `herdr agent wait`)
-  4  usage error (bad/missing flag, an unknown --states token, or --states with no real state)
+  4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
+     or an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
+  6  a --targets entry could not be resolved to a pane_id via `herdr agent get` (rule 8)
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
   hit (exit 0):    {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>"}
@@ -183,6 +232,49 @@ done
 case "$STALL_AFTER" in ''|*[!0-9]*) usage ;; esac
 [ "${#STALL_AFTER}" -le 9 ] || usage
 
+# rule 9 (#9): reject a non-numeric/zero/negative/overlong --poll, --safety-net or
+# --overall-timeout loudly (usage error), the same way rule 6 guards --stall-after above —
+# the length cap matters as much as the digits-only check, since past ~19 digits the
+# arithmetic comparisons below would themselves error ("integer expression expected"),
+# letting an absurd value slip past unnoticed instead of failing closed.
+validate_positive_int() {
+  local flag="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "herdr-ewait: --$flag must be a positive integer number of seconds, got '$value'" >&2
+      usage
+      ;;
+  esac
+  if [ "${#value}" -gt 9 ]; then
+    echo "herdr-ewait: --$flag is too large, got '$value'" >&2
+    usage
+  fi
+  if [ "$value" -le 0 ]; then
+    echo "herdr-ewait: --$flag must be > 0, got '$value'" >&2
+    usage
+  fi
+}
+
+validate_positive_int poll "$POLL"
+validate_positive_int safety-net "$SAFETY_NET"
+validate_positive_int overall-timeout "$OVERALL_TIMEOUT"
+
+if [ "$POLL" -gt "$SAFETY_NET" ]; then
+  echo "herdr-ewait: --poll (${POLL}s) must not exceed --safety-net (${SAFETY_NET}s)" >&2
+  usage
+fi
+if [ "$SAFETY_NET" -gt "$OVERALL_TIMEOUT" ]; then
+  echo "herdr-ewait: --safety-net (${SAFETY_NET}s) must not exceed --overall-timeout (${OVERALL_TIMEOUT}s)" >&2
+  usage
+fi
+# rule 9 continued: #9's actual root cause — a caller passed millisecond-sized values
+# (10000/30000) for second-based flags. A value past this ceiling is overwhelmingly more
+# likely to be a unit mistake than a genuine multi-minute interval, so say so directly.
+if [ "$POLL" -gt "$INTERVAL_CEILING_S" ] || [ "$SAFETY_NET" -gt "$INTERVAL_CEILING_S" ]; then
+  echo "herdr-ewait: --poll and --safety-net must each be <= ${INTERVAL_CEILING_S}s (got poll=${POLL}s, safety-net=${SAFETY_NET}s) — a value this large almost certainly means milliseconds, not seconds" >&2
+  usage
+fi
+
 # rule 7 (#903): normalize + validate --states before it ever reaches an ERE. Both grep call sites
 # below splice $STATES verbatim into "^($STATES)$"-shaped alternations, which only works when the
 # caller's separator is a pipe — a comma-delimited value (the natural typo, since --targets uses
@@ -215,6 +307,29 @@ for i in "${!TARGET_ARR[@]}"; do
   t="${t#"${t%%[![:space:]]*}"}"
   t="${t%"${t##*[![:space:]]}"}"
   TARGET_ARR[$i]="$t"
+done
+
+# Rule 8 (#9): resolve each --targets entry — pane id, agent name, or label — to its
+# canonical pane_id via `herdr agent get`, once, right here. From this point on,
+# TARGET_ARR holds pane_ids only: the log pre-filter below matches `"pane_id":"<id>"`,
+# never a name, so every later call (check-first, log-match verify, safety net, stall
+# sweep) must use the resolved form too, or it silently can't match the log at all.
+resolve_pane_id() {
+  local target="$1"
+  herdr agent get "$target" 2>/dev/null \
+    | grep -o '"pane_id":"[^"]*"' \
+    | head -n1 \
+    | sed -E 's/"pane_id":"([^"]*)"/\1/'
+}
+
+for i in "${!TARGET_ARR[@]}"; do
+  t="${TARGET_ARR[$i]}"
+  resolved="$(resolve_pane_id "$t" || true)"
+  if [ -z "$resolved" ]; then
+    echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (unknown target, pane gone, or herdr unreachable)" >&2
+    exit 6
+  fi
+  TARGET_ARR[$i]="$resolved"
 done
 
 # Parse "agent_status":"<state>" out of one `herdr agent get <id>` JSON line, grep/sed only.
@@ -292,6 +407,11 @@ else
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
   printf '%s' "$CURSOR" > "$CURSOR_FILE"
 fi
+
+# Startup diagnostic (#9): print exactly what this run resolved to, in seconds, so a
+# misconfigured waiter is visible in the caller's own output immediately — instead of
+# only showing up, hours later, as unexplained silence (see #9's root cause).
+echo "herdr-ewait: targets=$(IFS=,; echo "${TARGET_ARR[*]}") states=$STATES poll=${POLL}s safety-net=${SAFETY_NET}s overall-timeout=${OVERALL_TIMEOUT}s cursor=$CURSOR" >&2
 
 START_TS=$(date +%s)
 LAST_SAFETY_NET=$START_TS
