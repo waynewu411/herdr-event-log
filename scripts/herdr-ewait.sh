@@ -23,16 +23,18 @@
 # "probe once (check-first), then give up immediately" (exit 2) — see rule 9.
 #
 # Stdout on success (exit 0): exactly one compact JSON line, nothing else:
-#   {"pane_id":"...","verified_state":"...","target":"...","ts":"<ISO8601 UTC>"}
+#   {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>","target":"..."}
 # (Exception: --help/-h also exits 0 but prints human-readable help to stdout, NOT a JSON hit
 # line — a caller parsing exit-0 stdout as a hit must not pass --help/-h. See print_help below.)
 # Stdout on a suspected stall (exit 5): one compact JSON line, nothing else:
-#   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","target":"...","ts":"<ISO8601 UTC>"}
+#   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","ts":"<ISO8601 UTC>","target":"..."}
 # Stdout on a target unreachable for a full --stall-after window (exit 5): detection_content_seq
 # is JSON null and agent_status is omitted, since neither could be read:
-#   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":null,"target":"...","ts":"<ISO8601 UTC>"}
+#   {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":null,"ts":"<ISO8601 UTC>","target":"..."}
 # "target" (M1, #9 review) is the original --targets entry this pane_id was resolved from
-# — equal to pane_id itself for a caller that already passed a pane id. Additive field.
+# — equal to pane_id itself for a caller that already passed a pane id. Additive field,
+# APPENDED after every pre-existing field (round-4 review, N1) so a consumer matching the
+# pre-"target" shape positionally or by regex is unaffected.
 #
 # Exit codes:
 #   0  hit — a target reached one of --states, verified by `herdr agent get`
@@ -64,8 +66,9 @@
 #      default, 600s vs. a 3600s timeout, has ~6x headroom).
 #   6  a --targets entry could not be resolved to a pane_id at startup — an unresolvable
 #      name, a pane id that does not exist (confirmed via `herdr pane get`, not just a
-#      guess — see rule 8 below), an empty entry, or herdr itself unreachable (NOT a pane
-#      id that exists but whose agent herdr simply hasn't classified yet). The waiter
+#      guess — see rule 8 below), or herdr itself unreachable (NOT a pane id that exists
+#      but whose agent herdr simply hasn't classified yet, and NOT an empty entry — those
+#      are dropped silently; an all-empty --targets is a usage error, exit 4). The waiter
 #      never starts rather than watching a filter that can never match.
 #
 # Five hardening rules (each numbered comment below fixes a live #820 bug):
@@ -143,9 +146,10 @@
 #   rules 1/4/5 retry `agent get` on their own schedule; no pane found exits 6 right here.
 #   Every other target resolves with the single `agent get` call above — this extra probe
 #   only fires for the one ambiguous case. Exit 6 is reserved for an unresolvable NAME, a
-#   pane id that doesn't exist, an empty --targets entry slipping through, or herdr itself
-#   being unreachable; the stderr message includes herdr's own error `code` when one was
-#   returned, so a caller can tell "fix my target" apart from "herdr is down".
+#   pane id that doesn't exist, or herdr itself being unreachable (NOT an empty --targets
+#   entry, which is dropped below rather than ever reaching resolution — round-4 review,
+#   L1); the stderr message includes herdr's own error `code` when one was returned, so a
+#   caller can tell "fix my target" apart from "herdr is down".
 #   Note: two --targets entries that resolve to the SAME pane (a duplicate, or a name
 #   alongside its own pane id) are each probed independently every tick — harmless, if
 #   mildly wasteful — and a hit reports whichever entry's turn came first in --targets
@@ -212,7 +216,11 @@
 #     when --poll/--safety-net are omitted (e.g. the issue's own `--overall-timeout
 #     2400000` alone, ~28 days). OVERALL_TIMEOUT_CEILING_S (24h) is deliberately far more
 #     generous than INTERVAL_CEILING_S — a long supervision wait is plausible in a way a
-#     multi-minute --poll never is — so this only ever catches an unambiguous mistake.
+#     multi-minute --poll never is. Round-4 review's own L3: issue 9 never asked for this
+#     ceiling at all, and making it a hard reject broke a previously-valid, pre-existing
+#     invocation (`--overall-timeout 100000`, 27.8h, ran fine on `main`) beyond what the
+#     issue required — so past this ceiling the script now only WARNS and keeps running
+#     with the caller's value, never exits as a usage error.
 #     N2 — `--overall-timeout 0` is a pre-existing, meaningful idiom ("probe once via
 #     check-first, then give up immediately") that predates all of rule 9's validation
 #     and worked on `main` with none at all. It is exempted from the > 0 requirement
@@ -220,6 +228,17 @@
 #     clamp/ordering checks above, which would otherwise try to clamp --safety-net/--poll
 #     DOWN TO ZERO — meaningless, and self-defeating, since the main loop body that would
 #     use them never runs when --overall-timeout is 0 anyway.
+#   Round-4 review's other half of L3 — `--poll 0.5` (a fractional second) ran on `main`
+#   (plain `sleep 0.5`, no validation existed at all) and is a usage error here. Left as
+#   a deliberate, documented behaviour change rather than restored: issue 9 itself asks
+#   for the `--poll > --safety-net` / `--safety-net > --overall-timeout` ordering checks
+#   above, and bash's own `[ "$POLL" -gt "$SAFETY_NET" ]` — along with every other
+#   comparison, clamp and the `${#value}` length guard this rule and rule 6 rely on — is
+#   integer-only; accepting fractional seconds would mean reimplementing all of that
+#   arithmetic through an external tool (`awk`/`bc`), which is not universally on PATH
+#   the way `sleep`, `grep` and `sed` are, for a sub-second poll interval against agent
+#   state that itself only changes on human/agent-action timescales. validate_positive_int
+#   below rejects non-digit input (so `0.5`, like `5s` or `-1`) by design, not oversight.
 
 set -euo pipefail
 
@@ -268,11 +287,13 @@ REQUIRED:
                         live agent name (whatever `herdr agent get` itself accepts; it does
                         NOT accept a bare label). Every entry is resolved to its pane_id at
                         startup (rule 8); an entry that genuinely can't be resolved (unknown
-                        name, nonexistent pane id, empty entry, herdr unreachable) exits 6
-                        immediately, before any waiting begins. A pane id that DOES exist
-                        but whose agent herdr hasn't classified yet is kept as-is, not
-                        rejected — see rule 8. Wakes on whichever target moves first; the
-                        hit/stall JSON line also carries this original entry back as
+                        name, nonexistent pane id, herdr unreachable) exits 6 immediately,
+                        before any waiting begins. An empty entry (from a doubled or
+                        trailing comma) is dropped, not resolved — an all-empty --targets
+                        is a usage error, exit 4. A pane id that DOES exist but whose agent
+                        herdr hasn't classified yet is kept as-is, not rejected — see
+                        rule 8. Wakes on whichever target moves first; the hit/stall JSON
+                        line also carries this original entry back as
                         "target", alongside the resolved "pane_id".
   --log <file>          The herdr-event-log file (the event bus) to consume.
   --cursor-file <file>  This waiter's own byte-cursor file (independent per consumer).
@@ -289,7 +310,9 @@ OPTIONAL:
   --overall-timeout N   Max SECONDS to wait before giving up. Default: 3600. 0 is a
                         special case: "probe once (check-first), then give up
                         immediately" (exit 2) — a pre-existing idiom, kept working as-is.
-                        Otherwise must be > 0 and <= 86400s (24h).
+                        Otherwise must be > 0; past 86400s (24h) this only WARNS (not a
+                        usage error — issue 9 never asked for a ceiling here) that the
+                        value might be milliseconds, and keeps running with it as given.
   --poll N              SECONDS between log-cursor polls. Default: 5, clamped down to fit
                         --safety-net when omitted. Must be <= --safety-net and <= 300s.
   --safety-net N        SECONDS between unconditional live `agent get` sweeps. Default: 60,
@@ -302,10 +325,13 @@ OPTIONAL:
   --help, -h            Print this help to stdout and exit 0.
 
   --poll, --safety-net and --overall-timeout are all SECONDS, never milliseconds (rule 9).
-  --poll/--safety-net must be a positive integer <= 300s; --overall-timeout must be 0 (see
-  above) or a positive integer <= 86400s; a value past either ceiling almost always means
-  the caller passed milliseconds by mistake, and the error says so — checked BEFORE the
-  ordering rule below, so it fires regardless of what the other flags happen to be.
+  --poll/--safety-net must be a positive integer <= 300s (a usage error past that — a
+  value this large almost always means milliseconds); --overall-timeout must be 0 (see
+  above) or a positive integer, with only a WARNING (not a usage error) past 86400s,
+  since issue 9 never asked for a ceiling on --overall-timeout and a genuine multi-day
+  wait is plausible there in a way a multi-minute --poll never is. The --poll/--safety-net
+  ceiling is checked BEFORE the ordering rule below, so it fires regardless of what the
+  other flags happen to be.
   --poll must not exceed --safety-net, which must not exceed --overall-timeout (skipped
   entirely when --overall-timeout is 0, since nothing in that case ever uses them). These
   three ordering/ceiling checks only bind a flag you actually pass: an OMITTED
@@ -319,17 +345,20 @@ EXIT CODES:
   2  overall timeout reached with no verified hit
   3  log file missing/unreadable at start (caller falls back to `herdr agent wait`)
   4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
-     or an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9)
+     an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9 — or
+     a --targets with no non-empty entries left after dropping doubled/trailing commas)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
   6  a --targets entry could not be resolved to a pane_id — an unresolvable name, a
-     nonexistent pane id, an empty entry, or herdr unreachable (NOT a pane id that
-     exists but whose agent herdr hasn't classified yet; see rule 8 and --targets above)
+     nonexistent pane id, or herdr unreachable (NOT a pane id that exists but whose
+     agent herdr hasn't classified yet, and NOT an empty entry — see rule 8 and
+     --targets above)
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
-  hit (exit 0):    {"pane_id":"...","verified_state":"...","target":"...","ts":"<ISO8601 UTC>"}
-  stall (exit 5):  {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","target":"...","ts":"..."}
+  hit (exit 0):    {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>","target":"..."}
+  stall (exit 5):  {"pane_id":"...","suspected_stall_s":...,"detection_content_seq":...,"agent_status":"working","ts":"...","target":"..."}
   "target" is the original --targets entry this line's "pane_id" was resolved from (equal
-  to "pane_id" itself for a caller that already passed a pane id).
+  to "pane_id" itself for a caller that already passed a pane id), appended last so it
+  never reorders the fields that predate it.
 EOF
   exit 0
 }
@@ -412,12 +441,16 @@ validate_nonnegative_int overall-timeout "$OVERALL_TIMEOUT"
 # but the same millisecond mistake survives when a caller drops those two and passes just
 # --overall-timeout (e.g. the issue's own 2400000 == ~28 days). OVERALL_TIMEOUT_CEILING_S
 # is deliberately far more generous than INTERVAL_CEILING_S — a multi-hour or even
-# multi-day supervision wait is plausible in a way a multi-minute --poll never is — so
-# this only ever catches an unambiguous unit mistake, never a legitimate long wait. 0 is
+# multi-day supervision wait is plausible in a way a multi-minute --poll never is. 0 is
 # exempt (see above): it is never a scaled-up millisecond value, since 0ms == 0s.
+# L3 fix (#9 round-4 review): unlike --poll/--safety-net, issue 9 never asked for a
+# ceiling on --overall-timeout at all — and `--overall-timeout 100000` (27.8h) ran fine
+# on `main`. A hard reject here broke that previously-valid invocation beyond what the
+# issue required. Past the ceiling this now only WARNS (still naming the millisecond
+# mistake) and keeps the caller's value — never a usage error — so a genuine long
+# supervision wait is never rejected, only flagged.
 if [ "$OVERALL_TIMEOUT" -gt "$OVERALL_TIMEOUT_CEILING_S" ]; then
-  echo "herdr-ewait: --overall-timeout must be <= ${OVERALL_TIMEOUT_CEILING_S}s (got ${OVERALL_TIMEOUT}s) — a value this large almost certainly means milliseconds, not seconds" >&2
-  usage
+  echo "herdr-ewait: warning: --overall-timeout is ${OVERALL_TIMEOUT}s, above the ${OVERALL_TIMEOUT_CEILING_S}s (24h) sanity threshold — if this was meant to be milliseconds, divide by 1000; proceeding with the value as given" >&2
 fi
 
 # N2 continued: --poll/--safety-net are only ever USED inside the main loop body, which
@@ -684,10 +717,13 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # the caller wrote it) so a multi-target caller can tell which of ITS OWN entries fired —
 # before this, a name caller only ever saw a resolved pane_id it never passed, with no way
 # to map a hit back to its own bookkeeping without an extra skip-level `agent get` of its
-# own. Additive field; existing field order/keys are unchanged.
+# own. Additive field, APPENDED after every pre-existing field (round-4 review, N1: it
+# was originally inserted before "ts", which reorders the line rather than only adding to
+# it — a consumer matching on `..."verified_state":"...","ts":...` positionally or by
+# regex would break on that, where appending strictly after "ts" cannot).
 emit_hit() {
   local pane="$1" state="$2" orig="$3"
-  printf '{"pane_id":"%s","verified_state":"%s","target":"%s","ts":"%s"}\n' "$pane" "$state" "$orig" "$(now_iso)"
+  printf '{"pane_id":"%s","verified_state":"%s","ts":"%s","target":"%s"}\n' "$pane" "$state" "$(now_iso)" "$orig"
 }
 
 # Rule 4 (verify-on-hit): re-check a candidate hit with `agent get` before trusting it.
@@ -930,8 +966,8 @@ while :; do
         elif [ $(( NOW_TS - miss_since )) -ge "$STALL_AFTER" ]; then
           # Unreachable for a full window — report rather than silently waiting out
           # --overall-timeout for a target that may no longer exist.
-          printf '{"pane_id":"%s","suspected_stall_s":%s,"detection_content_seq":null,"target":"%s","ts":"%s"}\n' \
-            "$t" "$(( NOW_TS - miss_since ))" "${ORIG_TARGET_ARR[$i]}" "$(now_iso)"
+          printf '{"pane_id":"%s","suspected_stall_s":%s,"detection_content_seq":null,"ts":"%s","target":"%s"}\n' \
+            "$t" "$(( NOW_TS - miss_since ))" "$(now_iso)" "${ORIG_TARGET_ARR[$i]}"
           exit 5
         fi
         continue
@@ -958,8 +994,8 @@ while :; do
             # pane checked right after it stopped being legitimately blocked, whose
             # between-tick blocked time this rule can't otherwise see) can never fire on
             # its own; only a confirmed full window can.
-            printf '{"pane_id":"%s","suspected_stall_s":%s,"detection_content_seq":%s,"agent_status":"%s","target":"%s","ts":"%s"}\n' \
-              "$t" "$(( NOW_TS - STALL_TS_ARR[i] ))" "$seq" "$status" "${ORIG_TARGET_ARR[$i]}" "$(now_iso)"
+            printf '{"pane_id":"%s","suspected_stall_s":%s,"detection_content_seq":%s,"agent_status":"%s","ts":"%s","target":"%s"}\n' \
+              "$t" "$(( NOW_TS - STALL_TS_ARR[i] ))" "$seq" "$status" "$(now_iso)" "${ORIG_TARGET_ARR[$i]}"
             exit 5
           fi
           # First unchanged+working observation of a new bracket — record it and restart
