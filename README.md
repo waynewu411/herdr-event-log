@@ -190,9 +190,11 @@ scripts/herdr-ewait.sh \
   log only ever carries `pane_id`, never a name, so this is what makes a name
   target work with the log-detection path at all). A target that genuinely
   can't be resolved — an unknown name, a `pane_id` that does not exist
-  (confirmed with `herdr pane get`, not just assumed), an empty entry, or
-  herdr itself unreachable — exits immediately with code `6` rather than
-  starting a waiter that can never match. A `pane_id` that **does** exist
+  (confirmed with `herdr pane get`, not just assumed), or herdr itself
+  unreachable — exits immediately with code `6` rather than starting a
+  waiter that can never match. An empty entry (from a doubled or trailing
+  comma) is dropped instead, not resolved; a `--targets` value with no
+  non-empty entries left is a usage error, exit `4`. A `pane_id` that **does** exist
   but whose agent herdr hasn't classified yet (`agent_not_found` with the
   pane itself confirmed present — the normal race right after dispatching a
   fresh pane) is kept as-is and the script keeps waiting, not rejected.
@@ -213,12 +215,21 @@ scripts/herdr-ewait.sh \
 - `--cursor-file` persists the byte cursor across calls.
 - `--overall-timeout`, `--poll`, and `--safety-net` are all in **seconds**
   (never milliseconds) and tune the total wait, the bounded read interval,
-  and the periodic verification sweep. `--poll`/`--safety-net` must be a
-  positive integer `<= 300s`; `--overall-timeout` must be `0` (see below) or
-  a positive integer `<= 86400s` (24h). A value past either ceiling (e.g.
-  `10000`, or `2400000`) almost always means milliseconds were passed by
-  mistake, and the error says so — checked **before** the ordering rule
-  below, so it fires regardless of what the other flags happen to be.
+  and the periodic verification sweep. All three must be a whole number —
+  this is a deliberate, intentional behaviour change from `main` (where
+  e.g. `--poll 0.5` worked, since nothing validated it at all): issue 9's
+  own `--poll > --safety-net` / `--safety-net > --overall-timeout` ordering
+  checks below are bash integer comparisons, so a fractional value is
+  rejected rather than silently truncated or mishandled. `--poll`/
+  `--safety-net` must be a positive integer `<= 300s` — a value past that
+  (e.g. `10000`) almost
+  always means milliseconds were passed by mistake, and is a usage error,
+  checked **before** the ordering rule below so it fires regardless of what
+  the other flags happen to be. `--overall-timeout` must be `0` (see below)
+  or a positive integer; past `86400s` (24h) it only **warns** on stderr
+  (not a usage error — issue 9 scoped the hard ceiling to `--poll`/
+  `--safety-net` only, and a multi-day supervision wait is plausible) and
+  keeps running with the value as given.
   `--poll` must not exceed `--safety-net`, which must not exceed
   `--overall-timeout` (skipped entirely when `--overall-timeout` is `0`,
   since nothing in that case ever uses them — see below). These
@@ -249,12 +260,14 @@ immediately, not only as unexplained silence hours later.
 On success stdout is exactly one compact JSON line:
 
 ```json
-{"pane_id":"w3:p2","verified_state":"done","target":"w3:p2","ts":"2026-08-15T00:00:00Z"}
+{"pane_id":"w3:p2","verified_state":"done","ts":"2026-08-15T00:00:00Z","target":"w3:p2"}
 ```
 
 `"target"` is the original `--targets` entry this `"pane_id"` was resolved
 from — equal to `"pane_id"` itself for a caller that already passed a
-`pane_id`. (Two `--targets` entries that resolve to the same pane — a
+`pane_id`. It is appended after every pre-existing field rather than
+inserted among them, so it is strictly additive for a consumer matching
+on the fields that predate it. (Two `--targets` entries that resolve to the same pane — a
 duplicate, or a name alongside its own `pane_id` — are each probed
 independently every tick, not deduplicated; a hit reports whichever entry's
 turn came first.)
@@ -262,12 +275,14 @@ turn came first.)
 Exit codes: `0` for a verified hit, `2` for overall timeout, `3` when the log
 is missing/unreadable at start (the caller can fall back to the degraded
 `herdr agent wait` path), `4` for a usage error (bad flags, invalid
-`--states`, or an invalid/out-of-range `--poll`/`--safety-net`/
-`--overall-timeout`), `5` for a suspected stall (only with `--stall-after`
-set), and `6` when a `--targets` entry could not be resolved to a `pane_id`
-(an unresolvable name, a nonexistent `pane_id`, an empty entry, or herdr
+`--states`, an invalid/out-of-range `--poll`/`--safety-net`/
+`--overall-timeout`, or a `--targets` with no non-empty entries left after
+dropping doubled/trailing commas), `5` for a suspected stall (only with
+`--stall-after` set), and `6` when a `--targets` entry could not be resolved
+to a `pane_id` (an unresolvable name, a nonexistent `pane_id`, or herdr
 unreachable — not a `pane_id` that exists but whose agent simply hasn't been
-classified yet). The exit-`6` message includes herdr's own error code when
+classified yet, and not an empty entry, which is dropped rather than
+resolved). The exit-`6` message includes herdr's own error code when
 one was returned (e.g. `agent_not_found`, `pane_not_found`,
 `server_not_running`); for a non-JSON failure (herdr absent entirely, a
 shell-level error) it instead quotes whatever text was actually printed,
@@ -322,10 +337,13 @@ make clean   # remove the built binary
   its socket is down (exit `6` with herdr's own error code, or the raw
   failure text when there is no code to surface), an empty `--targets` entry
   (skipped, not fatal), every invalid-interval case — including the exact
-  300s/24h ceiling boundaries, the millisecond hint firing regardless of
-  which single flag is set, `--overall-timeout 0`'s pre-existing "probe
-  once" idiom staying valid, and an omitted `--poll`/`--safety-net` being
-  clamped to fit a short explicit `--overall-timeout` rather than rejected,
+  300s `--poll`/`--safety-net` ceiling boundary (a usage error), the 24h
+  `--overall-timeout` ceiling only warning rather than rejecting (so a
+  previously-valid 27.8h wait stays accepted), the millisecond hint firing
+  regardless of which single flag is set, `--overall-timeout 0`'s
+  pre-existing "probe once" idiom staying valid, and an omitted
+  `--poll`/`--safety-net` being clamped to fit a short explicit
+  `--overall-timeout` rather than rejected,
   while passing all three explicitly and then shortening only
   `--overall-timeout` still correctly errors — and the
   check-first/log-hit/safety-net-hit/overall-timeout paths, plus a name
