@@ -18,7 +18,9 @@
 # rejected, since that is a normal detection-lag race, not a bad target (rule 8).
 # --overall-timeout, --poll and --safety-net are all in SECONDS, not milliseconds; an
 # explicitly-set one is validated strictly, but an OMITTED --poll/--safety-net is clamped
-# down to fit an explicit --overall-timeout rather than rejected (see rule 9 below).
+# down to fit an explicit, nonzero --overall-timeout rather than rejected (see rule 9
+# below). --overall-timeout 0 is a special case, kept working as a pre-existing idiom:
+# "probe once (check-first), then give up immediately" (exit 2) — see rule 9.
 #
 # Stdout on success (exit 0): exactly one compact JSON line, nothing else:
 #   {"pane_id":"...","verified_state":"...","target":"...","ts":"<ISO8601 UTC>"}
@@ -148,6 +150,17 @@
 #   alongside its own pane id) are each probed independently every tick — harmless, if
 #   mildly wasteful — and a hit reports whichever entry's turn came first in --targets
 #   order; this is not deduplicated.
+#   Two more failure shapes, round-3 review (#9):
+#     L1 — a non-JSON failure (herdr absent from PATH, a shell permission error, a panic
+#     printed as plain text) has no `code` to surface. The exit-6 message now includes
+#     the first non-blank line of whatever herdr/the shell actually printed (trimmed,
+#     length-capped), so "no herdr on PATH" doesn't read as "bad target name".
+#     L2 — herdr can exit 0 (success) with a response that simply doesn't contain
+#     `"pane_id":"..."` — an unexpected/renamed shape, not a failure herdr reported at
+#     all. This is handled the same way as the detection-lag race above: a target that
+#     already looks like a pane id is kept as-is (one-time warning), since there is
+#     nothing to resolve either way; a NAME still exits 6, but the message says the
+#     response shape was the problem, not the target.
 #
 # Rule 9 — validate --poll/--safety-net/--overall-timeout as seconds (#9):
 #   All three are documented as seconds, but nothing enforced that: #9's root cause was a
@@ -180,6 +193,25 @@
 #   --stall-after is a separate, independently-validated flag (rule 6) and is NOT part of
 #   this ordering — sizing it relative to --overall-timeout is the caller's job (see rule 6's
 #   own "well under a third" guidance), not something rule 9 enforces.
+#   Three more gaps, round-3 review (#9):
+#     L3 — the ceiling check (above) now runs BEFORE the ordering checks, not after. A
+#     bare `--poll 10000` (--safety-net left at its default 60) used to be rejected by
+#     the ordering check first ("omit --poll ... instead of passing the default
+#     explicitly" — which doesn't describe passing an explicit oversized value). The
+#     millisecond hint now fires for every value past the ceiling, regardless of what
+#     the other flags are set to.
+#     L4 — --overall-timeout itself had no ceiling, so the same unit mistake survives
+#     when --poll/--safety-net are omitted (e.g. the issue's own `--overall-timeout
+#     2400000` alone, ~28 days). OVERALL_TIMEOUT_CEILING_S (24h) is deliberately far more
+#     generous than INTERVAL_CEILING_S — a long supervision wait is plausible in a way a
+#     multi-minute --poll never is — so this only ever catches an unambiguous mistake.
+#     N2 — `--overall-timeout 0` is a pre-existing, meaningful idiom ("probe once via
+#     check-first, then give up immediately") that predates all of rule 9's validation
+#     and worked on `main` with none at all. It is exempted from the > 0 requirement
+#     (via validate_nonnegative_int, not validate_positive_int) and from the
+#     clamp/ordering checks above, which would otherwise try to clamp --safety-net/--poll
+#     DOWN TO ZERO — meaningless, and self-defeating, since the main loop body that would
+#     use them never runs when --overall-timeout is 0 anyway.
 
 set -euo pipefail
 
@@ -192,6 +224,7 @@ POLL=5
 SAFETY_NET=60
 STALL_AFTER=0   # rule 6: opt-in; 0 = disabled, fully backward compatible
 readonly INTERVAL_CEILING_S=300   # rule 9: named ceiling for --poll/--safety-net, in seconds
+readonly OVERALL_TIMEOUT_CEILING_S=86400   # rule 9 (L4, #9 round-3 review): --overall-timeout ceiling, 24h
 # rule 9 (H2 fix, #9 review): track which interval flags the caller actually passed, so an
 # omitted one can be clamped to fit an explicit --overall-timeout instead of rejected.
 POLL_SET=0
@@ -245,7 +278,10 @@ OPTIONAL:
                         with no real state at all, is a usage error (exit 4) — never a
                         silent no-op filter. Prefer omitting this unless you genuinely need
                         to NARROW the set — the default already covers blocked|done|idle.
-  --overall-timeout N   Max SECONDS to wait before giving up. Default: 3600.
+  --overall-timeout N   Max SECONDS to wait before giving up. Default: 3600. 0 is a
+                        special case: "probe once (check-first), then give up
+                        immediately" (exit 2) — a pre-existing idiom, kept working as-is.
+                        Otherwise must be > 0 and <= 86400s (24h).
   --poll N              SECONDS between log-cursor polls. Default: 5, clamped down to fit
                         --safety-net when omitted. Must be <= --safety-net and <= 300s.
   --safety-net N        SECONDS between unconditional live `agent get` sweeps. Default: 60,
@@ -258,13 +294,16 @@ OPTIONAL:
   --help, -h            Print this help to stdout and exit 0.
 
   --poll, --safety-net and --overall-timeout are all SECONDS, never milliseconds (rule 9).
-  Each must be a positive integer; --poll must not exceed --safety-net, which must not
-  exceed --overall-timeout; and --poll/--safety-net must not exceed the 300s ceiling — a
-  larger value (e.g. 10000) almost always means the caller passed milliseconds by mistake.
-  These three checks only bind a flag you actually pass: an OMITTED --poll/--safety-net is
-  clamped down to fit an explicit --overall-timeout instead of being rejected, so
-  `--overall-timeout 30` alone (a short wait with everything else left at its default)
-  stays valid exactly as before this rule existed.
+  --poll/--safety-net must be a positive integer <= 300s; --overall-timeout must be 0 (see
+  above) or a positive integer <= 86400s; a value past either ceiling almost always means
+  the caller passed milliseconds by mistake, and the error says so — checked BEFORE the
+  ordering rule below, so it fires regardless of what the other flags happen to be.
+  --poll must not exceed --safety-net, which must not exceed --overall-timeout (skipped
+  entirely when --overall-timeout is 0, since nothing in that case ever uses them). These
+  three ordering/ceiling checks only bind a flag you actually pass: an OMITTED
+  --poll/--safety-net is clamped down to fit an explicit, nonzero --overall-timeout
+  instead of being rejected, so `--overall-timeout 30` alone (a short wait with
+  everything else left at its default) stays valid exactly as before this rule existed.
 
 EXIT CODES:
   0  hit — a target reached one of --states, verified live by `herdr agent get`
@@ -337,50 +376,104 @@ validate_positive_int() {
   fi
 }
 
+# N2 fix (#9 round-3 review, backward-compat priority): --overall-timeout alone is the
+# one flag where 0 is a pre-existing, meaningful value — "probe once (check-first), then
+# exit 2 immediately" — that worked on `main` with no validation at all (the main loop's
+# very first `ELAPSED -ge OVERALL_TIMEOUT` check fires before anything else runs). A
+# plain `validate_positive_int` would reject it. Only --overall-timeout gets this
+# non-negative variant; --poll/--safety-net still require > 0 (a zero interval there is
+# never intentional — it would busy-loop or skip verification entirely).
+validate_nonnegative_int() {
+  local flag="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "herdr-ewait: --$flag must be a non-negative integer number of seconds, got '$value'" >&2
+      usage
+      ;;
+  esac
+  if [ "${#value}" -gt 9 ]; then
+    echo "herdr-ewait: --$flag is too large, got '$value'" >&2
+    usage
+  fi
+}
+
 # Validate --overall-timeout first: the clamping below needs a sane, already-validated
 # value to clamp the omitted defaults DOWN to.
-validate_positive_int overall-timeout "$OVERALL_TIMEOUT"
+validate_nonnegative_int overall-timeout "$OVERALL_TIMEOUT"
+# L4 fix (#9 round-3 review): issue 9 scoped the 300s ceiling to --poll/--safety-net only,
+# but the same millisecond mistake survives when a caller drops those two and passes just
+# --overall-timeout (e.g. the issue's own 2400000 == ~28 days). OVERALL_TIMEOUT_CEILING_S
+# is deliberately far more generous than INTERVAL_CEILING_S — a multi-hour or even
+# multi-day supervision wait is plausible in a way a multi-minute --poll never is — so
+# this only ever catches an unambiguous unit mistake, never a legitimate long wait. 0 is
+# exempt (see above): it is never a scaled-up millisecond value, since 0ms == 0s.
+if [ "$OVERALL_TIMEOUT" -gt "$OVERALL_TIMEOUT_CEILING_S" ]; then
+  echo "herdr-ewait: --overall-timeout must be <= ${OVERALL_TIMEOUT_CEILING_S}s (got ${OVERALL_TIMEOUT}s) — a value this large almost certainly means milliseconds, not seconds" >&2
+  usage
+fi
 
-# H2 fix (#9 review): an omitted --safety-net/--poll is clamped to fit an explicit
-# --overall-timeout rather than validated against its unchanged default — see rule 9 above
-# for why. Only ever clamps DOWN, and only when the caller did not pass the flag itself, so
-# an explicit value (valid or not) is never silently overridden.
-if [ "$SAFETY_NET_SET" -eq 0 ] && [ "$OVERALL_TIMEOUT" -lt "$SAFETY_NET" ]; then
-  SAFETY_NET="$OVERALL_TIMEOUT"
+# N2 continued: --poll/--safety-net are only ever USED inside the main loop body, which
+# --overall-timeout 0 never reaches (check-first already ran; the loop's first iteration
+# exits 2 before any sleep or safety-net sweep). Clamping them against a zero timeout, or
+# checking their ordering against it, would be both meaningless and actively harmful (it
+# would clamp a default SAFETY_NET/POLL down to 0, which then fails their own > 0
+# validation below) — so skip both the clamp and the ordering checks entirely in this
+# case. An explicitly-passed --poll/--safety-net still gets its own positive-int and
+# ceiling validation either way; only the OVERALL_TIMEOUT-relative parts are skipped.
+if [ "$OVERALL_TIMEOUT" -gt 0 ]; then
+  # H2 fix (#9 round-1 review): an omitted --safety-net/--poll is clamped to fit an
+  # explicit --overall-timeout rather than validated against its unchanged default — see
+  # rule 9 above for why. Only ever clamps DOWN, and only when the caller did not pass the
+  # flag itself, so an explicit value (valid or not) is never silently overridden.
+  if [ "$SAFETY_NET_SET" -eq 0 ] && [ "$OVERALL_TIMEOUT" -lt "$SAFETY_NET" ]; then
+    SAFETY_NET="$OVERALL_TIMEOUT"
+  fi
 fi
 validate_positive_int safety-net "$SAFETY_NET"
 
-if [ "$POLL_SET" -eq 0 ] && [ "$SAFETY_NET" -lt "$POLL" ]; then
+if [ "$OVERALL_TIMEOUT" -gt 0 ] && [ "$POLL_SET" -eq 0 ] && [ "$SAFETY_NET" -lt "$POLL" ]; then
   POLL="$SAFETY_NET"
 fi
 validate_positive_int poll "$POLL"
+
+# L3 fix (#9 round-3 review): the ceiling check must run BEFORE the ordering checks
+# below, not after — a bare `--poll 10000` (safety-net left at its default 60) used to
+# be rejected by the poll>safety-net ORDERING check first, whose "omit --poll ... instead
+# of passing the default explicitly" message doesn't describe what the caller actually
+# did (they passed an explicit, oversized value, not a default). Checking the ceiling
+# first means the millisecond hint fires for every value past it, regardless of what the
+# other two flags happen to be set to. rule 9's actual root cause — a caller passed
+# millisecond-sized values (10000/30000) for second-based flags — is overwhelmingly more
+# likely than a genuine multi-minute poll/safety-net interval, so say so directly.
+if [ "$POLL" -gt "$INTERVAL_CEILING_S" ] || [ "$SAFETY_NET" -gt "$INTERVAL_CEILING_S" ]; then
+  echo "herdr-ewait: --poll and --safety-net must each be <= ${INTERVAL_CEILING_S}s (got poll=${POLL}s, safety-net=${SAFETY_NET}s) — a value this large almost certainly means milliseconds, not seconds" >&2
+  usage
+fi
 
 # L1 fix (#9 round-2 review): the clamp above only ever applies to an OMITTED flag — a
 # caller who passes all three explicitly (e.g. copying the README's own example verbatim
 # and then shortening just --overall-timeout) gets a real ordering violation here, not a
 # clamp. That is intentional (an explicit value is never silently overridden), but the
 # cheapest fix is usually to stop passing the default explicitly, so say that directly.
-if [ "$POLL" -gt "$SAFETY_NET" ]; then
-  echo "herdr-ewait: --poll (${POLL}s) must not exceed --safety-net (${SAFETY_NET}s) — omit --poll (and/or --safety-net) to let it clamp down to --overall-timeout automatically instead of passing the default explicitly" >&2
-  usage
-fi
-if [ "$SAFETY_NET" -gt "$OVERALL_TIMEOUT" ]; then
-  echo "herdr-ewait: --safety-net (${SAFETY_NET}s) must not exceed --overall-timeout (${OVERALL_TIMEOUT}s) — omit --safety-net (and/or --poll) to let it clamp down to --overall-timeout automatically instead of passing the default explicitly" >&2
-  usage
-fi
-# rule 9 continued: #9's actual root cause — a caller passed millisecond-sized values
-# (10000/30000) for second-based flags. A value past this ceiling is overwhelmingly more
-# likely to be a unit mistake than a genuine multi-minute interval, so say so directly.
-if [ "$POLL" -gt "$INTERVAL_CEILING_S" ] || [ "$SAFETY_NET" -gt "$INTERVAL_CEILING_S" ]; then
-  echo "herdr-ewait: --poll and --safety-net must each be <= ${INTERVAL_CEILING_S}s (got poll=${POLL}s, safety-net=${SAFETY_NET}s) — a value this large almost certainly means milliseconds, not seconds" >&2
-  usage
+if [ "$OVERALL_TIMEOUT" -gt 0 ]; then
+  if [ "$POLL" -gt "$SAFETY_NET" ]; then
+    echo "herdr-ewait: --poll (${POLL}s) must not exceed --safety-net (${SAFETY_NET}s) — omit --poll (and/or --safety-net) to let it clamp down to --overall-timeout automatically instead of passing the default explicitly" >&2
+    usage
+  fi
+  if [ "$SAFETY_NET" -gt "$OVERALL_TIMEOUT" ]; then
+    echo "herdr-ewait: --safety-net (${SAFETY_NET}s) must not exceed --overall-timeout (${OVERALL_TIMEOUT}s) — omit --safety-net (and/or --poll) to let it clamp down to --overall-timeout automatically instead of passing the default explicitly" >&2
+    usage
+  fi
 fi
 # Normalize to plain base-10 integers (e.g. "007" -> "7") now that every value has passed
 # validation. `[` already compares these in decimal regardless, so this is cosmetic only —
-# it keeps the startup diagnostic line below from echoing a confusing "poll=007s".
+# it keeps the startup diagnostic line below from echoing a confusing "poll=007s" (N5 fix,
+# #9 round-3 review: STALL_AFTER is normalized here too, for the same reason — it is
+# validated above but was the one interval the original normalization step missed).
 POLL=$((10#$POLL))
 SAFETY_NET=$((10#$SAFETY_NET))
 OVERALL_TIMEOUT=$((10#$OVERALL_TIMEOUT))
+STALL_AFTER=$((10#$STALL_AFTER))
 
 # rule 7 (#903): normalize + validate --states before it ever reaches an ERE. Both grep call sites
 # below splice $STATES verbatim into "^($STATES)$"-shaped alternations, which only works when the
@@ -452,11 +545,15 @@ for i in "${!TARGET_ARR[@]}"; do
   # thing this fallback needs to work at all, silently disabling it against real herdr
   # while the (unfaithful) test stub still passed. Capture both streams here with
   # `2>&1`; `get_status`/the stall sweep below only ever need success fields and keep
-  # discarding stderr as before. `|| true` on BOTH greps below: under `set -o
-  # pipefail`, a no-match `grep` (exit 1) — the normal case for a pane_id-less error
-  # response — would otherwise fail the whole pipeline and kill the script right here
-  # via `set -e`, before the fallback logic below ever runs.
-  RESOLVE_RESP="$(herdr agent get "$t" 2>&1 || true)"
+  # discarding stderr as before. RESOLVE_STATUS is captured separately (L2 fix, #9
+  # round-3 review) via `|| RESOLVE_STATUS=$?` rather than `|| true`, so later checks can
+  # tell "herdr itself reported failure" apart from "herdr exited 0 but its response
+  # didn't parse the way we expected" — the two need different handling below. `|| true`
+  # on the grep pipeline: under `set -o pipefail`, a no-match `grep` (exit 1) — the
+  # normal case for a pane_id-less response — would otherwise fail the whole pipeline
+  # and kill the script right here via `set -e`, before the fallback logic ever runs.
+  RESOLVE_STATUS=0
+  RESOLVE_RESP="$(herdr agent get "$t" 2>&1)" || RESOLVE_STATUS=$?
   resolved="$(printf '%s' "$RESOLVE_RESP" | grep -o '"pane_id":"[^"]*"' | head -n1 | sed -E 's/"pane_id":"([^"]*)"/\1/' || true)"
   if [ -n "$resolved" ]; then
     TARGET_ARR[$i]="$resolved"
@@ -468,6 +565,24 @@ for i in "${!TARGET_ARR[@]}"; do
   # hasn't been classified yet" from a genuinely bad target, and what lets the caller
   # reading stderr tell "fix my target" apart from "herdr itself is unreachable".
   code="$(printf '%s' "$RESOLVE_RESP" | grep -o '"code":"[^"]*"' | head -n1 | sed -E 's/"code":"([^"]*)"/\1/' || true)"
+
+  # L2 fix (#9 round-3 review): herdr exited 0 (success) but nothing matched
+  # `"pane_id":"..."` — an unexpected/renamed response shape (verified against a fake
+  # herdr that nests the field differently), not a failure herdr itself reported. This
+  # is NOT the same situation as an unresolvable target: herdr didn't say anything was
+  # wrong. If the target already looks like a pane id, there's nothing to resolve in the
+  # first place — keep it as-is (same posture as the detection-lag fallback just below)
+  # rather than fail-closed on a parsing gap that isn't the caller's fault. For a NAME
+  # there is no safe fallback identity, so this still exits 6, but says accurately that
+  # herdr succeeded and the shape was the problem, not "unknown target".
+  if [ "$RESOLVE_STATUS" -eq 0 ] && [ -z "$code" ]; then
+    if [[ "$t" =~ $PANE_ID_RE ]]; then
+      echo "herdr-ewait: warning: 'herdr agent get $t' succeeded but its response had no recognizable pane_id field (unexpected response shape) — using '$t' as-is and continuing to wait" >&2
+      continue
+    fi
+    echo "herdr-ewait: could not resolve target '$t': herdr returned success (exit 0) but its response had no recognizable pane_id field (unexpected response shape, not an unresolvable target)" >&2
+    exit 6
+  fi
 
   # H1/M2 fix (#9 round-2 review): a pane id is already the canonical form `herdr agent
   # get` would otherwise give us — there is nothing to resolve. But `agent_not_found` on
@@ -498,7 +613,20 @@ for i in "${!TARGET_ARR[@]}"; do
   if [ -n "$code" ]; then
     echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' ($code)" >&2
   else
-    echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (unknown target, pane gone, or herdr unreachable)" >&2
+    # L1 fix (#9 round-3 review): a non-JSON failure (herdr absent from PATH, a shell
+    # permission error, a panic printed as plain text) has no "code" to surface, and
+    # round 2's generic message discarded whatever herdr/the shell actually printed —
+    # an operator reading "(unknown target, pane gone, or herdr unreachable)" would go
+    # looking for a bad target name even when the real cause is, say, no herdr on PATH
+    # at all. Surface the first non-blank line of the captured output (trimmed,
+    # length-capped so one giant stack trace can't flood stderr) when there is one.
+    raw_line="$(printf '%s' "$RESOLVE_RESP" | grep -m1 -v '^[[:space:]]*$' || true)"
+    raw_line="$(printf '%s' "$raw_line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160)"
+    if [ -n "$raw_line" ]; then
+      echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (unknown target, pane gone, or herdr unreachable — herdr said: \"$raw_line\")" >&2
+    else
+      echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (unknown target, pane gone, or herdr unreachable)" >&2
+    fi
   fi
   exit 6
 done
@@ -561,7 +689,14 @@ verify_and_maybe_emit() {
   return 1
 }
 
-# Establish/resume the byte cursor.
+# Establish/resume the byte cursor. Note (N1, #9 round-3 review): this now runs BEFORE
+# check-first (moved there so the startup diagnostic below can include the cursor — see
+# round-2's N2 nit) rather than after, as it was on `main` and in round 1. The observable
+# effect: a run that hits immediately on check-first now still leaves a cursor file
+# behind, which it never did before. Outcome-neutral for this script's own behavior (a
+# later resumed run just replays a few already-verified log lines that verify-on-hit
+# re-checks and discards), but worth knowing if some OTHER tool treats "no cursor file"
+# as a proxy for "this waiter never started".
 if [ -f "$CURSOR_FILE" ]; then
   CURSOR="$(cat "$CURSOR_FILE" 2>/dev/null || echo 0)"
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
@@ -575,15 +710,15 @@ else
   printf '%s' "$CURSOR" > "$CURSOR_FILE"
 fi
 
-# Startup diagnostic (#9, M1/N2 fixes from #9 review): print exactly what this run
-# resolved to, in seconds, so a misconfigured waiter is visible in the caller's own
-# output immediately — instead of only showing up, hours later, as unexplained silence
-# (see #9's root cause). Printed BEFORE check-first (N2, round-2 review) so it always
-# prints, even on a run that hits immediately — issue 9 asked for this line "at startup",
-# not only for a run that ends up actually waiting. Each target is shown as
-# original=resolved (e.g. "alice=w7:p3"), equal on both sides for a caller that already
-# passed a pane id, so the mapping — not just the resolved id — is visible without a
-# separate `herdr agent get` of the caller's own.
+# Startup diagnostic (#9, round-1/round-2 fixes): print exactly what this run resolved
+# to, in seconds, so a misconfigured waiter is visible in the caller's own output
+# immediately — instead of only showing up, hours later, as unexplained silence (see #9's
+# root cause). Printed BEFORE check-first (round-2 review) so it always prints, even on a
+# run that hits immediately — issue 9 asked for this line "at startup", not only for a
+# run that ends up actually waiting. Each target is shown as original=resolved (e.g.
+# "alice=w7:p3"), equal on both sides for a caller that already passed a pane id, so the
+# mapping — not just the resolved id — is visible without a separate `herdr agent get` of
+# the caller's own.
 TARGETS_DISPLAY=""
 for i in "${!TARGET_ARR[@]}"; do
   entry="${ORIG_TARGET_ARR[$i]}=${TARGET_ARR[$i]}"
