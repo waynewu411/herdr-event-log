@@ -60,10 +60,11 @@
 #      `--stall-after` (~2x for a target already stalled when the wait starts). Size
 #      `--stall-after` well under a THIRD of `--overall-timeout` accordingly (the shipped
 #      default, 600s vs. a 3600s timeout, has ~6x headroom).
-#   6  a --targets entry could not be resolved to a pane_id via `herdr agent get` at
-#      startup — an unresolvable name, an empty entry, or herdr itself unreachable (NOT a
-#      pane id whose agent herdr simply hasn't classified yet — see rule 8 below). The
-#      waiter never starts rather than watching a filter that can never match.
+#   6  a --targets entry could not be resolved to a pane_id at startup — an unresolvable
+#      name, a pane id that does not exist (confirmed via `herdr pane get`, not just a
+#      guess — see rule 8 below), an empty entry, or herdr itself unreachable (NOT a pane
+#      id that exists but whose agent herdr simply hasn't classified yet). The waiter
+#      never starts rather than watching a filter that can never match.
 #
 # Five hardening rules (each numbered comment below fixes a live #820 bug):
 #   1. check-first        4. verify-on-hit
@@ -120,17 +121,33 @@
 #   kept alongside its resolution (in ORIG_TARGET_ARR) purely for display and for the
 #   optional "target" field on a hit/stall line — never for lookups.
 #   A target that fails to resolve is NOT always a bad target: `herdr agent get` on a pane
-#   that exists but whose agent herdr has not classified yet returns `agent_not_found`,
-#   exit 1 — the normal result of a supervisor starting a wait immediately after dispatching
-#   a fresh pane, before herdr's (asynchronous) detection catches up. Round-1 review (#9)
-#   caught this: the first version of this rule exited 6 on that race, breaking a
-#   previously-working pane-id caller. So: if the target already looks like a pane id
-#   (`$PANE_ID_RE`) and herdr's response code is specifically `agent_not_found`, this rule
-#   keeps the target as-is (with a one-time warning) and lets rules 1/4/5 retry it on their
-#   own schedule — it is already in canonical form, so there is nothing to resolve. Exit 6
-#   is reserved for an unresolvable NAME, an empty --targets entry slipping through, or
-#   herdr itself being unreachable; the stderr message includes herdr's own error `code`
-#   when one was returned, so a caller can tell "fix my target" apart from "herdr is down".
+#   that exists but whose agent herdr has not classified yet returns `agent_not_found` —
+#   the normal result of a supervisor starting a wait immediately after dispatching a
+#   fresh pane, before herdr's (asynchronous) detection catches up. Round-1 review (#9)
+#   caught the SHAPE of this fix but not a load-bearing detail: herdr writes its error
+#   JSON to STDERR (success goes to stdout), and round 1's resolve call discarded stderr
+#   (`2>/dev/null`), so `agent_not_found` was silently unobservable against REAL herdr —
+#   the fallback below was dead code in production even though the (unfaithful) test
+#   stub made it look fixed. Round 2 captures both streams (`2>&1`) here instead; `get_status`
+#   and the stall sweep below only ever need success fields and keep discarding stderr.
+#   Once the code is visible, `agent_not_found` on something that already looks like a
+#   pane id (`$PANE_ID_RE`) is STILL ambiguous on its own, though: herdr returns that same
+#   code for "pane exists, no agent classified yet" (keep waiting) and for "no such pane"
+#   (a typo'd/stale id — also round-2 review, M2), and conflating them would let a typo
+#   wait out the full --overall-timeout, exactly the failure mode issue 9 exists to kill.
+#   So this rule asks one more question in that specific case — `herdr pane get` — which
+#   returns a pane_id for any real pane (regardless of its agent) and `pane_not_found` for
+#   one that doesn't exist: a found pane keeps the target as-is (one-time warning) and lets
+#   rules 1/4/5 retry `agent get` on their own schedule; no pane found exits 6 right here.
+#   Every other target resolves with the single `agent get` call above — this extra probe
+#   only fires for the one ambiguous case. Exit 6 is reserved for an unresolvable NAME, a
+#   pane id that doesn't exist, an empty --targets entry slipping through, or herdr itself
+#   being unreachable; the stderr message includes herdr's own error `code` when one was
+#   returned, so a caller can tell "fix my target" apart from "herdr is down".
+#   Note: two --targets entries that resolve to the SAME pane (a duplicate, or a name
+#   alongside its own pane id) are each probed independently every tick — harmless, if
+#   mildly wasteful — and a hit reports whichever entry's turn came first in --targets
+#   order; this is not deduplicated.
 #
 # Rule 9 — validate --poll/--safety-net/--overall-timeout as seconds (#9):
 #   All three are documented as seconds, but nothing enforced that: #9's root cause was a
@@ -151,7 +168,15 @@
 #   omitted --poll to `min(5, safety-net)` — silently, before validation — so a caller who
 #   only ever set --overall-timeout keeps working exactly as before this rule existed. Only
 #   a flag the caller explicitly set takes part in the checks as a hard constraint; the
-#   clamped-down defaults always satisfy them by construction.
+#   clamped-down defaults always satisfy them by construction. Note (#9 round-2 review,
+#   N1): this clamp chains — an explicit --safety-net below the --poll default (e.g.
+#   --safety-net 2 with --poll omitted) now also clamps --poll's default down to 2s
+#   (previously 5s). Harmless, and arguably the more correct default, but it IS a
+#   behaviour change for that specific previously-valid invocation, worth knowing about.
+#   A caller who passes ALL of --poll/--safety-net/--overall-timeout explicitly (e.g. the
+#   README's own example) gets no clamp at all — a real ordering violation there is a
+#   genuine usage error, not something this rule silently repairs (round-2 review, L1);
+#   the fix in that case is to stop passing the unchanged defaults explicitly.
 #   --stall-after is a separate, independently-validated flag (rule 6) and is NOT part of
 #   this ordering — sizing it relative to --overall-timeout is the caller's job (see rule 6's
 #   own "well under a third" guidance), not something rule 9 enforces.
@@ -202,11 +227,12 @@ REQUIRED:
                         live agent name (whatever `herdr agent get` itself accepts; it does
                         NOT accept a bare label). Every entry is resolved to its pane_id at
                         startup (rule 8); an entry that genuinely can't be resolved (unknown
-                        name, empty entry, herdr unreachable) exits 6 immediately, before
-                        any waiting begins. A pane id whose agent herdr hasn't classified
-                        yet is kept as-is, not rejected — see rule 8. Wakes on whichever
-                        target moves first; the hit/stall JSON line also carries this
-                        original entry back as "target", alongside the resolved "pane_id".
+                        name, nonexistent pane id, empty entry, herdr unreachable) exits 6
+                        immediately, before any waiting begins. A pane id that DOES exist
+                        but whose agent herdr hasn't classified yet is kept as-is, not
+                        rejected — see rule 8. Wakes on whichever target moves first; the
+                        hit/stall JSON line also carries this original entry back as
+                        "target", alongside the resolved "pane_id".
   --log <file>          The herdr-event-log file (the event bus) to consume.
   --cursor-file <file>  This waiter's own byte-cursor file (independent per consumer).
 
@@ -248,9 +274,9 @@ EXIT CODES:
   4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
      or an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
-  6  a --targets entry could not be resolved to a pane_id via `herdr agent get` — an
-     unresolvable name, an empty entry, or herdr unreachable (NOT a pane id whose agent
-     herdr hasn't classified yet; see rule 8 and --targets above)
+  6  a --targets entry could not be resolved to a pane_id — an unresolvable name, a
+     nonexistent pane id, an empty entry, or herdr unreachable (NOT a pane id that
+     exists but whose agent herdr hasn't classified yet; see rule 8 and --targets above)
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
   hit (exit 0):    {"pane_id":"...","verified_state":"...","target":"...","ts":"<ISO8601 UTC>"}
@@ -329,12 +355,17 @@ if [ "$POLL_SET" -eq 0 ] && [ "$SAFETY_NET" -lt "$POLL" ]; then
 fi
 validate_positive_int poll "$POLL"
 
+# L1 fix (#9 round-2 review): the clamp above only ever applies to an OMITTED flag — a
+# caller who passes all three explicitly (e.g. copying the README's own example verbatim
+# and then shortening just --overall-timeout) gets a real ordering violation here, not a
+# clamp. That is intentional (an explicit value is never silently overridden), but the
+# cheapest fix is usually to stop passing the default explicitly, so say that directly.
 if [ "$POLL" -gt "$SAFETY_NET" ]; then
-  echo "herdr-ewait: --poll (${POLL}s) must not exceed --safety-net (${SAFETY_NET}s)" >&2
+  echo "herdr-ewait: --poll (${POLL}s) must not exceed --safety-net (${SAFETY_NET}s) — omit --poll (and/or --safety-net) to let it clamp down to --overall-timeout automatically instead of passing the default explicitly" >&2
   usage
 fi
 if [ "$SAFETY_NET" -gt "$OVERALL_TIMEOUT" ]; then
-  echo "herdr-ewait: --safety-net (${SAFETY_NET}s) must not exceed --overall-timeout (${OVERALL_TIMEOUT}s)" >&2
+  echo "herdr-ewait: --safety-net (${SAFETY_NET}s) must not exceed --overall-timeout (${OVERALL_TIMEOUT}s) — omit --safety-net (and/or --poll) to let it clamp down to --overall-timeout automatically instead of passing the default explicitly" >&2
   usage
 fi
 # rule 9 continued: #9's actual root cause — a caller passed millisecond-sized values
@@ -416,11 +447,16 @@ for i in "${!TARGET_ARR[@]}"; do
   t="${TARGET_ARR[$i]}"
   ORIG_TARGET_ARR[$i]="$t"
 
-  # `|| true` on BOTH greps below: under `set -o pipefail`, a no-match `grep` (exit 1) —
-  # the normal case for a pane_id-less error response, or an unreachable herdr's empty
-  # output — would otherwise fail the whole pipeline and kill the script right here via
-  # `set -e`, before the fallback logic below ever runs (caught in #9 round-2 review).
-  RESOLVE_RESP="$(herdr agent get "$t" 2>/dev/null || true)"
+  # H1 fix (#9 round-2 review): herdr writes its SUCCESS json to stdout but its ERROR
+  # json to STDERR — `2>/dev/null` (round 1's capture) therefore threw away the one
+  # thing this fallback needs to work at all, silently disabling it against real herdr
+  # while the (unfaithful) test stub still passed. Capture both streams here with
+  # `2>&1`; `get_status`/the stall sweep below only ever need success fields and keep
+  # discarding stderr as before. `|| true` on BOTH greps below: under `set -o
+  # pipefail`, a no-match `grep` (exit 1) — the normal case for a pane_id-less error
+  # response — would otherwise fail the whole pipeline and kill the script right here
+  # via `set -e`, before the fallback logic below ever runs.
+  RESOLVE_RESP="$(herdr agent get "$t" 2>&1 || true)"
   resolved="$(printf '%s' "$RESOLVE_RESP" | grep -o '"pane_id":"[^"]*"' | head -n1 | sed -E 's/"pane_id":"([^"]*)"/\1/' || true)"
   if [ -n "$resolved" ]; then
     TARGET_ARR[$i]="$resolved"
@@ -433,14 +469,30 @@ for i in "${!TARGET_ARR[@]}"; do
   # reading stderr tell "fix my target" apart from "herdr itself is unreachable".
   code="$(printf '%s' "$RESOLVE_RESP" | grep -o '"code":"[^"]*"' | head -n1 | sed -E 's/"code":"([^"]*)"/\1/' || true)"
 
-  # H1 fix: a pane id is already the canonical form `herdr agent get` would otherwise give
-  # us — there is nothing to resolve. `agent_not_found` on something that already LOOKS
-  # like a pane id ($PANE_ID_RE) means herdr just hasn't classified an agent there yet
-  # (the normal race right after dispatching a fresh pane), not a bad target. Keep it
-  # as-is and keep waiting; rules 1/4/5 will retry `herdr agent get` on their own schedule.
+  # H1/M2 fix (#9 round-2 review): a pane id is already the canonical form `herdr agent
+  # get` would otherwise give us — there is nothing to resolve. But `agent_not_found` on
+  # something that already LOOKS like a pane id ($PANE_ID_RE) is ambiguous on its own:
+  # herdr returns the SAME code whether the pane exists with no classified agent yet
+  # (the normal race right after dispatching a fresh pane — keep waiting) or the pane
+  # doesn't exist at all (a typo'd/stale id — issue 9's "never start a waiter that
+  # cannot match" applies just as much here). `herdr pane get` tells the two apart: it
+  # returns a pane_id for any real pane regardless of its agent, and `pane_not_found`
+  # for one that isn't. Only probe this — one extra call — in this specific ambiguous
+  # case; every other target resolves with the single `agent get` call above.
   if [ "$code" = "agent_not_found" ] && [[ "$t" =~ $PANE_ID_RE ]]; then
-    echo "herdr-ewait: warning: '$t' looks like a pane id but herdr has not detected an agent there yet (agent_not_found) — using it as-is and continuing to wait" >&2
-    continue
+    PANE_RESP="$(herdr pane get "$t" 2>&1 || true)"
+    pane_found="$(printf '%s' "$PANE_RESP" | grep -o '"pane_id":"[^"]*"' | head -n1 | sed -E 's/"pane_id":"([^"]*)"/\1/' || true)"
+    if [ -n "$pane_found" ]; then
+      echo "herdr-ewait: warning: '$t' looks like a pane id but herdr has not detected an agent there yet (agent_not_found) — using it as-is and continuing to wait" >&2
+      continue
+    fi
+    pane_code="$(printf '%s' "$PANE_RESP" | grep -o '"code":"[^"]*"' | head -n1 | sed -E 's/"code":"([^"]*)"/\1/' || true)"
+    if [ -n "$pane_code" ]; then
+      echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (agent_not_found; herdr pane get also failed: $pane_code — the pane itself does not appear to exist)" >&2
+    else
+      echo "herdr-ewait: could not resolve target '$t' to a pane_id via 'herdr agent get' (agent_not_found; the pane itself does not appear to exist either)" >&2
+    fi
+    exit 6
   fi
 
   if [ -n "$code" ]; then
@@ -509,35 +561,29 @@ verify_and_maybe_emit() {
   return 1
 }
 
-# Rule 1 (check-first): before any waiting, check every target once. Kills the
-# "first observed state is already terminal" race — cursor-snapshot timing stops
-# being safety-critical because we never rely on the log alone.
-for i in "${!TARGET_ARR[@]}"; do
-  if verify_and_maybe_emit "${TARGET_ARR[$i]}" "${ORIG_TARGET_ARR[$i]}"; then
-    exit 0
-  fi
-done
-
 # Establish/resume the byte cursor.
 if [ -f "$CURSOR_FILE" ]; then
   CURSOR="$(cat "$CURSOR_FILE" 2>/dev/null || echo 0)"
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
 else
-  # F1: a fresh waiter has no interest in history — check-first (rule 1, above) already
-  # covers "the target is already settled". Starting at 0 would replay the entire
-  # session log on tick one, spending one spurious `agent get` per stale pre-filter
-  # match. Start at the log's CURRENT size instead, and persist it immediately.
+  # F1: a fresh waiter has no interest in history — check-first (below) already covers
+  # "the target is already settled". Starting at 0 would replay the entire session log
+  # on tick one, spending one spurious `agent get` per stale pre-filter match. Start at
+  # the log's CURRENT size instead, and persist it immediately.
   CURSOR="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ' || true)"
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
   printf '%s' "$CURSOR" > "$CURSOR_FILE"
 fi
 
-# Startup diagnostic (#9, M1 fix from #9 review): print exactly what this run resolved to,
-# in seconds, so a misconfigured waiter is visible in the caller's own output immediately
-# — instead of only showing up, hours later, as unexplained silence (see #9's root cause).
-# Each entry is shown as original=resolved (e.g. "alice=w7:p3"), equal on both sides for a
-# caller that already passed a pane id, so the mapping — not just the resolved id — is
-# visible without a separate `herdr agent get` of the caller's own.
+# Startup diagnostic (#9, M1/N2 fixes from #9 review): print exactly what this run
+# resolved to, in seconds, so a misconfigured waiter is visible in the caller's own
+# output immediately — instead of only showing up, hours later, as unexplained silence
+# (see #9's root cause). Printed BEFORE check-first (N2, round-2 review) so it always
+# prints, even on a run that hits immediately — issue 9 asked for this line "at startup",
+# not only for a run that ends up actually waiting. Each target is shown as
+# original=resolved (e.g. "alice=w7:p3"), equal on both sides for a caller that already
+# passed a pane id, so the mapping — not just the resolved id — is visible without a
+# separate `herdr agent get` of the caller's own.
 TARGETS_DISPLAY=""
 for i in "${!TARGET_ARR[@]}"; do
   entry="${ORIG_TARGET_ARR[$i]}=${TARGET_ARR[$i]}"
@@ -547,7 +593,16 @@ for i in "${!TARGET_ARR[@]}"; do
     TARGETS_DISPLAY="$TARGETS_DISPLAY,$entry"
   fi
 done
-echo "herdr-ewait: targets=$TARGETS_DISPLAY states=$STATES poll=${POLL}s safety-net=${SAFETY_NET}s overall-timeout=${OVERALL_TIMEOUT}s cursor=$CURSOR" >&2
+echo "herdr-ewait: targets=$TARGETS_DISPLAY states=$STATES poll=${POLL}s safety-net=${SAFETY_NET}s overall-timeout=${OVERALL_TIMEOUT}s stall-after=${STALL_AFTER}s cursor=$CURSOR" >&2
+
+# Rule 1 (check-first): before any waiting, check every target once. Kills the
+# "first observed state is already terminal" race — cursor-snapshot timing stops
+# being safety-critical because we never rely on the log alone.
+for i in "${!TARGET_ARR[@]}"; do
+  if verify_and_maybe_emit "${TARGET_ARR[$i]}" "${ORIG_TARGET_ARR[$i]}"; then
+    exit 0
+  fi
+done
 
 START_TS=$(date +%s)
 LAST_SAFETY_NET=$START_TS
