@@ -210,7 +210,7 @@ scripts/herdr-ewait.sh \
   pane move` gives the pane a new, workspace-qualified `pane_id` and the old
   one stops resolving. Both the safety-net sweep (the `--safety-net` ticks)
   and the stall sweep (the `--stall-after` ticks, if enabled) detect this
-  themselves: the first time a live probe of the current `pane_id` comes
+  themselves: on any tick whose live probe of the current `pane_id` comes
   back completely empty, each re-resolves the *original* name and, if that
   now points at a different `pane_id`, switches to it (with a note on
   stderr) instead of stranding the wait on a dead pane for the rest of
