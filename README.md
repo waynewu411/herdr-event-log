@@ -188,27 +188,35 @@ scripts/herdr-ewait.sh \
   itself accepts (it does **not** accept a bare label) — and is resolved to
   its canonical `pane_id` once, at startup, before any waiting begins (the
   log only ever carries `pane_id`, never a name, so this is what makes a name
-  target work with the log-detection path at all). A target that genuinely
-  can't be resolved — an unknown name, a `pane_id` that does not exist
-  (confirmed with `herdr pane get`, not just assumed), or herdr itself
-  unreachable — exits immediately with code `6` rather than starting a
-  waiter that can never match. An empty entry (from a doubled or trailing
-  comma) is dropped instead, not resolved; a `--targets` value with no
-  non-empty entries left is a usage error, exit `4`. A `pane_id` that **does** exist
-  but whose agent herdr hasn't classified yet (`agent_not_found` with the
-  pane itself confirmed present — the normal race right after dispatching a
-  fresh pane) is kept as-is and the script keeps waiting, not rejected.
+  target work with the log-detection path at all). A NAME that genuinely
+  can't be resolved — unknown, or herdr itself unreachable — exits
+  immediately with code `6` rather than starting a waiter that can never
+  match (a name has no fallback identity, so there's nothing else it can
+  do). A `pane_id` that does not exist (confirmed with `herdr pane get`, not
+  just assumed) also exits `6`, but herdr itself being only *temporarily*
+  unreachable does not: a `pane_id` target already is the identity the rest
+  of the script needs, exactly like on `main` before any of this existed,
+  so it is kept as-is with a warning and the wait proceeds — only a
+  genuinely confirmed-gone pane fails closed. An empty entry (from a doubled
+  or trailing comma) is dropped instead, not resolved; a `--targets` value
+  with no non-empty entries left is a usage error, exit `4`. A `pane_id`
+  that **does** exist but whose agent herdr hasn't classified yet
+  (`agent_not_found` with the pane itself confirmed present — the normal
+  race right after dispatching a fresh pane) is kept as-is and the script
+  keeps waiting, not rejected.
   The hit/stall JSON also carries this original entry back as `"target"`,
   alongside the resolved `"pane_id"`.
 - A *name* target's resolved `pane_id` can go stale mid-wait — e.g. `herdr
   pane move` gives the pane a new, workspace-qualified `pane_id` and the old
-  one stops resolving. The safety-net sweep (the `--safety-net` ticks)
-  detects this itself: the first time a live probe of the current `pane_id`
-  comes back completely empty, it re-resolves the *original* name and, if
-  that now points at a different `pane_id`, switches to it and keeps
-  waiting (with a note on stderr) instead of stranding the wait on a dead
-  pane for the rest of `--overall-timeout`. A `pane_id` target given
-  directly is never re-resolved — there is no name to fall back on.
+  one stops resolving. Both the safety-net sweep (the `--safety-net` ticks)
+  and the stall sweep (the `--stall-after` ticks, if enabled) detect this
+  themselves: the first time a live probe of the current `pane_id` comes
+  back completely empty, each re-resolves the *original* name and, if that
+  now points at a different `pane_id`, switches to it (with a note on
+  stderr) instead of stranding the wait on a dead pane for the rest of
+  `--overall-timeout` — or, for the stall sweep specifically, instead of
+  misreporting the move itself as a suspected stall. A `pane_id` target
+  given directly is never re-resolved — there is no name to fall back on.
 - `--states` is a `|`-separated regex of statuses to accept; the default is
   `blocked|done|idle`.
 - `--log` is the per-instance event log described above.
@@ -248,10 +256,12 @@ scripts/herdr-ewait.sh \
 
 On startup, once targets are resolved, the script prints one diagnostic line
 to stderr — **before** check-first, so it prints even on a run that hits
-immediately (this does mean a cursor file is now created even on an
-immediate hit, where it previously wasn't — harmless for this script's own
-behavior, but worth knowing if some other tool treats "no cursor file" as a
-proxy for "never started"): each target as `original=resolved` (e.g.
+immediately. Only the diagnostic moved earlier; a fresh cursor file is still
+written only **after** check-first, exactly as on `main` — so an immediate
+hit is reported with exit `0` even if `--cursor-file` turns out to be
+unwritable, and (round-5 review, L2) no cursor file is created at all on a
+run that hits immediately, same as before this diagnostic existed. The line
+shows each target as `original=resolved` (e.g.
 `alice=w7:p3`), `--states`, `--poll`/`--safety-net`/`--overall-timeout`/
 `--stall-after` in seconds (after any clamping above), and the starting
 cursor — so a misconfigured waiter is visible in the caller's own output
@@ -276,13 +286,17 @@ Exit codes: `0` for a verified hit, `2` for overall timeout, `3` when the log
 is missing/unreadable at start (the caller can fall back to the degraded
 `herdr agent wait` path), `4` for a usage error (bad flags, invalid
 `--states`, an invalid/out-of-range `--poll`/`--safety-net`/
-`--overall-timeout`, or a `--targets` with no non-empty entries left after
-dropping doubled/trailing commas), `5` for a suspected stall (only with
+`--overall-timeout`, a `--targets` with no non-empty entries left after
+dropping doubled/trailing commas, or an unwritable `--cursor-file` once a
+run actually needs to persist one — never for a run whose first check
+already hits), `5` for a suspected stall (only with
 `--stall-after` set), and `6` when a `--targets` entry could not be resolved
-to a `pane_id` (an unresolvable name, a nonexistent `pane_id`, or herdr
-unreachable — not a `pane_id` that exists but whose agent simply hasn't been
-classified yet, and not an empty entry, which is dropped rather than
-resolved). The exit-`6` message includes herdr's own error code when
+to a `pane_id` (an unresolvable NAME, a nonexistent `pane_id`, or herdr
+unreachable for a NAME specifically — a `pane_id` target rides out herdr
+being merely *temporarily* unreachable instead, exactly as `main` did,
+since there's nothing to resolve either way; not a `pane_id` that exists
+but whose agent simply hasn't been classified yet, and not an empty entry,
+which is dropped rather than resolved). The exit-`6` message includes herdr's own error code when
 one was returned (e.g. `agent_not_found`, `pane_not_found`,
 `server_not_running`); for a non-JSON failure (herdr absent entirely, a
 shell-level error) it instead quotes whatever text was actually printed,
@@ -333,9 +347,13 @@ make clean   # remove the built binary
   rejected) versus a `pane_id` that does not exist at all (exit `6`, never
   waited out), a herdr *success* response with an unexpected shape (kept
   as-is for a `pane_id` target, exit `6` with an accurate message for a
-  name), an unresolvable name including when herdr itself is unreachable or
+  name), an unresolvable NAME including when herdr itself is unreachable or
   its socket is down (exit `6` with herdr's own error code, or the raw
-  failure text when there is no code to surface), an empty `--targets` entry
+  failure text when there is no code to surface) — and, for a `pane_id`
+  target specifically, that the SAME herdr-unreachable/socket-down
+  conditions are ridden out instead (not exit `6`), with a dedicated
+  recovery test proving the wait still succeeds once herdr comes back — an
+  empty `--targets` entry
   (skipped, not fatal), every invalid-interval case — including the exact
   300s `--poll`/`--safety-net` ceiling boundary (a usage error), the 24h
   `--overall-timeout` ceiling only warning rather than rejecting (so a
@@ -347,8 +365,14 @@ make clean   # remove the built binary
   while passing all three explicitly and then shortening only
   `--overall-timeout` still correctly errors — and the
   check-first/log-hit/safety-net-hit/overall-timeout paths, plus a name
-  target's `pane_id` moving mid-wait (the safety-net sweep re-resolves the
-  name and switches to the new `pane_id` instead of stranding the wait).
+  target's `pane_id` moving mid-wait — both that the safety-net sweep
+  re-resolves the name and switches to the new `pane_id` instead of
+  stranding the wait, and that the stall sweep does the same instead of
+  misreporting the move as exit `5` (and that a target which has genuinely,
+  permanently stopped responding — not merely moved — still correctly exits
+  `5`, including the working-but-unchanged flavor of a stall, both exit-`5`
+  JSON lines validated field-by-field) — and an unwritable `--cursor-file`
+  never costing an otherwise-successful immediate hit.
 
 None of this requires a live Herdr session. A GitHub Actions workflow
 (`.github/workflows/test.yml`) runs `make fmt`, `make vet`, `make build`, and
