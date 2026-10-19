@@ -49,8 +49,9 @@
 #      degraded `herdr agent wait` path — see references/supervision.md)
 #   4  usage error (bad/missing flag, an invalid --states token, an invalid/out-of-range
 #      --poll/--safety-net/--overall-timeout — see rule 9 below — a --targets value
-#      containing a newline/CR, a --targets entry containing a '"' or '\', or an unwritable
-#      --cursor-file once a run actually needs to persist one)
+#      containing a newline/CR, a --targets entry starting with '-', a --targets entry
+#      containing a '"' or '\', or an unwritable --cursor-file once a run actually needs
+#      to persist one)
 #   5  suspected stall (only possible when --stall-after > 0; see rule 6 below), one of:
 #        - a target's `detection_content_seq` has not moved across two bracketing
 #          `--stall-after` checks (so at least one full window, confirmed by TWO
@@ -290,14 +291,14 @@ REQUIRED:
                         NOT accept a bare label). Every entry is resolved to its pane_id at
                         startup (rule 8); an entry that genuinely can't be resolved (an
                         unknown name — including when herdr itself is unreachable — or a
-                        nonexistent pane id) exits 6 immediately, before any waiting
-                        begins. A pane id target rides out herdr being only TEMPORARILY
-                        unreachable instead (same as `main`), since it has nothing to
-                        resolve either way. An empty entry (from a doubled or
-                        trailing comma) is dropped, not resolved — an all-empty --targets
-                        is a usage error, exit 4; so is a --targets value containing a
-                        newline/CR, or an entry containing a '"' or '\'. A pane id that DOES
-                        exist but whose agent herdr hasn't classified yet is kept as-is, not
+                        nonexistent pane id) exits 6 immediately, before any waiting begins.
+                        A pane id target rides out herdr being only TEMPORARILY unreachable
+                        instead (same as `main`), since it has nothing to resolve either
+                        way. An empty entry (from a doubled or trailing comma) is dropped,
+                        not resolved — an all-empty --targets is a usage error, exit 4; so
+                        is a --targets value containing a newline/CR, an entry starting with
+                        '-', or an entry containing a '"' or '\'. A pane id that DOES exist
+                        but whose agent herdr hasn't classified yet is kept as-is, not
                         rejected — see rule 8. Wakes on whichever target moves first; the
                         hit/stall JSON line also carries this original entry back as
                         "target", alongside the resolved "pane_id".
@@ -353,9 +354,10 @@ EXIT CODES:
   4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
      an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9 — a
      --targets with no non-empty entries left after dropping doubled/trailing commas, a
-     --targets value containing a newline/CR, an entry containing a '"' or '\', or an
-     unwritable --cursor-file once a run actually needs to persist one — never for a
-     run whose check-first already hits, exit 0, same as `main`)
+     --targets value containing a newline/CR, an entry starting with '-', an entry
+     containing a '"' or '\', or an unwritable --cursor-file once a run actually needs
+     to persist one — never for a run whose check-first already hits, exit 0, same as
+     `main`)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
   6  a --targets entry could not be resolved to a pane_id — an unresolvable name
      (including when herdr itself is unreachable), or a nonexistent pane id (NOT a

@@ -291,25 +291,25 @@ is missing/unreadable at start (the caller can fall back to the degraded
 `--states`, an invalid/out-of-range `--poll`/`--safety-net`/
 `--overall-timeout`, a `--targets` with no non-empty entries left after
 dropping doubled/trailing commas, a `--targets` value containing a newline/CR,
-a `--targets` entry containing a `"` or `\`, or an unwritable `--cursor-file` once a
-run actually needs to persist one — never for a run whose first check
-already hits), `5` for a suspected stall (only with
-`--stall-after` set), and `6` when a `--targets` entry could not be resolved
-to a `pane_id` (an unresolvable NAME, a nonexistent `pane_id`, or herdr
-unreachable for a NAME specifically — a `pane_id` target rides out herdr
-being merely *temporarily* unreachable instead, exactly as `main` did,
-since there's nothing to resolve either way; not a `pane_id` that exists
-but whose agent simply hasn't been classified yet, and not an empty entry,
-which is dropped rather than resolved). The exit-`6` message includes herdr's own error code when
-one was returned (e.g. `agent_not_found`, `pane_not_found`,
+a `--targets` entry starting with `-`, a `--targets` entry containing a `"` or
+`\`, or an unwritable `--cursor-file` once a run actually needs to persist one
+— never for a run whose first check already hits), `5` for a suspected stall
+(only with `--stall-after` set), and `6` when a `--targets` entry could not be
+resolved to a `pane_id` (an unresolvable NAME, a nonexistent `pane_id`, or
+herdr unreachable for a NAME specifically — a `pane_id` target rides out herdr
+being merely *temporarily* unreachable instead, exactly as `main` did, since
+there's nothing to resolve either way; not a `pane_id` that exists but whose
+agent simply hasn't been classified yet, and not an empty entry, which is
+dropped rather than resolved). The exit-`6` message includes herdr's own error
+code when one was returned (e.g. `agent_not_found`, `pane_not_found`,
 `server_not_running`); for a non-JSON failure (herdr absent entirely, a
 shell-level error) it instead quotes whatever text was actually printed,
 rather than a generic guess. If herdr instead returns **success** with a
-response that just doesn't contain a recognizable `pane_id` (an unexpected
-or future-renamed shape, not a failure herdr itself reported), a `pane_id`
-target is kept as-is with a warning — the same posture as the
-detection-lag case above — while a name target still exits `6`, with a
-message that says the response shape was the problem, not the target.
+response that just doesn't contain a recognizable `pane_id` (an unexpected or
+future-renamed shape, not a failure herdr itself reported), a `pane_id` target
+is kept as-is with a warning — the same posture as the detection-lag case
+above — while a name target still exits `6`, with a message that says the
+response shape was the problem, not the target.
 
 Log matches are wake-up signals, not truth: every candidate hit and every
 periodic safety-net sweep is re-checked against `herdr agent get`, so a stale
