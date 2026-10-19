@@ -293,7 +293,7 @@ REQUIRED:
                         unknown name — including when herdr itself is unreachable — or a
                         nonexistent pane id) exits 6 immediately, before any waiting begins.
                         A pane id target rides out herdr being only TEMPORARILY unreachable
-                        instead (same as `main`), since it has nothing to resolve either
+                        instead, since it has nothing to resolve either
                         way. An empty entry (from a doubled or trailing comma) is dropped,
                         not resolved — an all-empty --targets is a usage error, exit 4; so
                         is a --targets value containing a newline/CR, an entry starting with
@@ -318,8 +318,8 @@ OPTIONAL:
                         special case: "probe once (check-first), then give up
                         immediately" (exit 2) — a pre-existing idiom, kept working as-is.
                         Otherwise must be > 0; past 86400s (24h) this only WARNS (not a
-                        usage error — issue 9 never asked for a ceiling here) that the
-                        value might be milliseconds, and keeps running with it as given.
+                        usage error — a hard ceiling would reject genuine long waits) that
+                        the value might be milliseconds, and keeps running with it as given.
   --poll N              SECONDS between log-cursor polls. Default: 5, clamped down to fit
                         --safety-net when omitted. Must be <= --safety-net and <= 300s.
   --safety-net N        SECONDS between unconditional live `agent get` sweeps. Default: 60,
@@ -335,8 +335,8 @@ OPTIONAL:
   --poll/--safety-net must be a positive integer <= 300s (a usage error past that — a
   value this large almost always means milliseconds); --overall-timeout must be 0 (see
   above) or a positive integer, with only a WARNING (not a usage error) past 86400s,
-  since issue 9 never asked for a ceiling on --overall-timeout and a genuine multi-day
-  wait is plausible there in a way a multi-minute --poll never is. The --poll/--safety-net
+  since a genuine multi-day wait is plausible there in a way a multi-minute --poll never
+  is. The --poll/--safety-net
   ceiling is checked BEFORE the ordering rule below, so it fires regardless of what the
   other flags happen to be.
   --poll must not exceed --safety-net, which must not exceed --overall-timeout (skipped
@@ -356,13 +356,12 @@ EXIT CODES:
      --targets with no non-empty entries left after dropping doubled/trailing commas, a
      --targets value containing a newline/CR, an entry starting with '-', an entry
      containing a '"' or '\', or an unwritable --cursor-file once a run actually needs
-     to persist one — never for a run whose check-first already hits, exit 0, same as
-     `main`)
+     to persist one — never for a run whose check-first already hits, exit 0)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
   6  a --targets entry could not be resolved to a pane_id — an unresolvable name
      (including when herdr itself is unreachable), or a nonexistent pane id (NOT a
      pane id that exists but whose agent hasn't classified yet; NOT a pane id when
-     herdr is only temporarily unreachable — ridden out instead, same as `main`; and
+     herdr is only temporarily unreachable — ridden out instead; and
      NOT an empty entry — see rule 8 and --targets above)
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
@@ -426,7 +425,7 @@ validate_positive_int() {
 }
 
 # --overall-timeout alone is the one flag where 0 is a pre-existing, meaningful value —
-# "probe once (check-first), then exit 2 immediately" — that worked on `main` with no
+# "probe once (check-first), then exit 2 immediately" — that worked with no
 # validation at all (the main loop's very first `ELAPSED -ge OVERALL_TIMEOUT` check fires
 # before anything else runs). A plain `validate_positive_int` would reject it. Only
 # --overall-timeout gets this non-negative variant; --poll/--safety-net still require > 0
@@ -681,7 +680,7 @@ for i in "${!TARGET_ARR[@]}"; do
     exit 6
   fi
 
-  # On `main`, a pane-id caller had nothing to resolve in the first place, so it rode out
+  # Before target resolution existed, a pane-id caller had nothing to resolve, so it rode out
   # a transient herdr outage at startup for free — every probe elsewhere in this script
   # is unconditionally tolerant (`|| true`) of herdr being briefly unreachable. A pane-id
   # target gets the same treatment here: herdr being down (not a bad target) is not a
@@ -815,11 +814,11 @@ reresolve_if_stale() {
 
 # Establish (but do not yet persist) the byte cursor. The VALUE is computed here, before
 # check-first, so the startup diagnostic below can include it — but the write-to-disk is
-# deliberately NOT done here. It is restored to its position on `main` — AFTER check-first
-# — below (CURSOR_IS_FRESH records which branch this was, since the "already exists"
-# branch never writes at all, matching `main`). An unwritable --cursor-file path must not
+# deliberately NOT done here. It is written AFTER check-first
+# below (CURSOR_IS_FRESH records which branch this was, since the "already exists"
+# branch never writes at all). An unwritable --cursor-file path must not
 # crash under `set -e` with a raw bash error even when the target was already terminal —
-# that would lose a hit `main` would have reported with exit 0.
+# that would lose a hit that should otherwise be reported with exit 0.
 if [ -f "$CURSOR_FILE" ]; then
   CURSOR="$(cat "$CURSOR_FILE" 2>/dev/null || echo 0)"
   case "$CURSOR" in ''|*[!0-9]*) CURSOR=0 ;; esac
@@ -861,7 +860,7 @@ for i in "${!TARGET_ARR[@]}"; do
   fi
 done
 
-# Persist a FRESH cursor only now, after check-first — same position as `main` — so an
+# Persist a FRESH cursor only now, after check-first — so an
 # immediate hit above is never lost to a bad --cursor-file path. Guarded (rather than left
 # to crash under `set -e`) so an unwritable path is a documented usage error, not a raw
 # bash error with an undocumented exit code.
