@@ -265,10 +265,291 @@ SAFETY_NET_SET=0
 # pane id herdr just hasn't classified yet".
 readonly PANE_ID_RE='^w[0-9A-Za-z]+:p[0-9A-Za-z]+$'
 
+# Vendoring (--check-source/--sync, see header "Vendoring" section above): new exit
+# codes, none colliding with the pre-existing 0-6.
+readonly EXIT_CHECK_SOURCE_DRIFT=7
+readonly EXIT_CHECK_SOURCE_FAIL=8
+readonly EXIT_CHECK_SOURCE_UPSTREAM_NEWER=9
+readonly EXIT_SYNC_NO_SIDECAR=10
+readonly EXIT_SYNC_ON_DEFAULT_BRANCH=11
+readonly EXIT_SYNC_BAD_DOWNLOAD=12
+readonly SIDECAR_NAME="herdr-ewait.source"
+readonly RAW_BASE_DEFAULT="https://raw.githubusercontent.com"
+readonly REMOTE_BASE_DEFAULT="https://github.com"
+
 usage() {
   echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N] [--stall-after N]" >&2
   echo "run '$0 --help' for full usage" >&2
   exit 4
+}
+
+# --- Vendoring: --check-source / --sync support (see header "Vendoring" section) ---
+# Standalone, herdr-free modes: no herdr calls, never touch the event log/cursor. Each
+# entry point (cmd_check_source, cmd_sync) always exits itself, on every path.
+
+# Resolves $0 to an absolute path, even when invoked via a relative path (tests always
+# pass an absolute path, but a real caller may not).
+script_self_path() {
+  case "$0" in
+    /*) printf '%s\n' "$0" ;;
+    *) printf '%s\n' "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  esac
+}
+
+script_dir() { dirname "$(script_self_path)"; }
+
+# Sidecar format (see header): simple key=value lines, '#' starts a comment, blank
+# lines ignored. Populates SIDECAR_REPO/SIDECAR_PATH/SIDECAR_SHA (empty if absent).
+SIDECAR_REPO=""
+SIDECAR_PATH=""
+SIDECAR_SHA=""
+load_sidecar() {
+  local file="$1" line trimmed key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="$(printf '%s' "${line%%#*}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -z "$trimmed" ] && continue
+    case "$trimmed" in
+      *=*)
+        key="${trimmed%%=*}"
+        value="${trimmed#*=}"
+        case "$key" in
+          repo) SIDECAR_REPO="$value" ;;
+          path) SIDECAR_PATH="$value" ;;
+          sha) SIDECAR_SHA="$value" ;;
+        esac
+        ;;
+    esac
+  done < "$file"
+}
+
+# Sidecar fields are attacker-controllable (anyone who can edit the vendored copy's
+# sidecar) and get spliced straight into a fetch URL — validate strictly before using
+# any of them, reject otherwise. repo: owner/name, each half [A-Za-z0-9_.-]+ only. path:
+# no leading '/', no '..' segment. sha: exactly 40 lowercase hex.
+validate_sidecar_fields() {
+  [ -n "$SIDECAR_REPO" ] && [ -n "$SIDECAR_PATH" ] && [ -n "$SIDECAR_SHA" ] || return 1
+  [[ "$SIDECAR_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  case "$SIDECAR_PATH" in /*|*..*) return 1 ;; esac
+  [[ "$SIDECAR_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  return 0
+}
+
+# Hashing: prefer sha256sum, fall back to shasum -a 256; HASH_TOOL is empty (and
+# resolve_hash_tool returns 1) if neither exists, so callers fail closed rather than
+# silently skip verification.
+HASH_TOOL=""
+resolve_hash_tool() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    HASH_TOOL="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    HASH_TOOL="shasum -a 256"
+  else
+    return 1
+  fi
+}
+sha256_of() { $HASH_TOOL "$1" 2>/dev/null | awk '{print $1}'; }
+
+# GNU `stat -c` vs BSD/macOS `stat -f`, tried in that order.
+perm_of_file() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+# Fetches https://raw.githubusercontent.com/<repo>/<sha>/<path> (or the
+# HERDR_EWAIT_RAW_BASE_URL test-hook override — see header) to $4. curl -fsSL fails
+# closed on any HTTP error or missing file; never used for anything but this fetch.
+fetch_raw() {
+  local repo="$1" sha="$2" path="$3" out="$4"
+  local base="${HERDR_EWAIT_RAW_BASE_URL:-$RAW_BASE_DEFAULT}"
+  curl -fsSL "$base/$repo/$sha/$path" -o "$out" 2>/dev/null
+}
+
+# Resolves $2 (a ref, e.g. "HEAD" or "refs/heads/main") of https://github.com/<repo>
+# (or the HERDR_EWAIT_REMOTE_BASE_URL test-hook override — see header) to a full sha via
+# `git ls-remote`. Prints nothing on failure; never used for anything but this.
+resolve_remote_ref() {
+  local repo="$1" ref="$2"
+  local base="${HERDR_EWAIT_REMOTE_BASE_URL:-$REMOTE_BASE_DEFAULT}"
+  git ls-remote "$base/$repo" "$ref" 2>/dev/null | awk '{print $1}' | head -n1
+}
+
+# --check-source [--latest]: read-only, no herdr calls, writes nothing.
+cmd_check_source() {
+  local latest="$1" dir sidecar
+  dir="$(script_dir)"
+  sidecar="$dir/$SIDECAR_NAME"
+
+  if [ ! -f "$sidecar" ]; then
+    echo "herdr-ewait: this copy is the source (no $SIDECAR_NAME sidecar found)"
+    exit 0
+  fi
+
+  load_sidecar "$sidecar"
+  if ! validate_sidecar_fields; then
+    echo "herdr-ewait: --check-source: sidecar '$sidecar' has invalid repo/path/sha fields — refusing to use them in a fetch URL" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  fi
+
+  if ! resolve_hash_tool; then
+    echo "herdr-ewait: --check-source: neither sha256sum nor shasum is available — cannot verify, failing closed" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  fi
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/herdr-ewait.check-source.XXXXXX" 2>/dev/null)" || {
+    echo "herdr-ewait: --check-source: failed to create a temp file" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  }
+  if ! fetch_raw "$SIDECAR_REPO" "$SIDECAR_SHA" "$SIDECAR_PATH" "$tmp"; then
+    rm -f "$tmp"
+    echo "herdr-ewait: --check-source: failed to fetch ${HERDR_EWAIT_RAW_BASE_URL:-$RAW_BASE_DEFAULT}/$SIDECAR_REPO/$SIDECAR_SHA/$SIDECAR_PATH" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  fi
+
+  local remote_hash local_hash
+  remote_hash="$(sha256_of "$tmp" || true)"
+  local_hash="$(sha256_of "$(script_self_path)" || true)"
+  rm -f "$tmp"
+  if [ -z "$remote_hash" ] || [ -z "$local_hash" ]; then
+    echo "herdr-ewait: --check-source: could not compute a sha256 hash — failing closed" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  fi
+
+  if [ "$remote_hash" != "$local_hash" ]; then
+    echo "herdr-ewait: --check-source: DRIFT — local sha256=$local_hash pinned-source sha256=$remote_hash (pinned at $SIDECAR_REPO@$SIDECAR_SHA:$SIDECAR_PATH)" >&2
+    exit "$EXIT_CHECK_SOURCE_DRIFT"
+  fi
+  echo "herdr-ewait: --check-source: match (sha256=$local_hash, pinned at $SIDECAR_REPO@$SIDECAR_SHA)"
+
+  if [ "$latest" -eq 1 ]; then
+    local head_sha
+    head_sha="$(resolve_remote_ref "$SIDECAR_REPO" HEAD || true)"
+    if [ -z "$head_sha" ]; then
+      echo "herdr-ewait: --check-source --latest: failed to resolve the default-branch head of $SIDECAR_REPO via git ls-remote" >&2
+      exit "$EXIT_CHECK_SOURCE_FAIL"
+    fi
+    if [ "$head_sha" != "$SIDECAR_SHA" ]; then
+      echo "herdr-ewait: --check-source --latest: upstream $SIDECAR_REPO has moved past the pinned sha ($SIDECAR_SHA -> $head_sha) — run --sync to update" >&2
+      exit "$EXIT_CHECK_SOURCE_UPSTREAM_NEWER"
+    fi
+  fi
+  exit 0
+}
+
+# Rewrites the sidecar's sha= line to $2, preserving every other line (including
+# comments) verbatim; prints the new content to stdout for the caller to redirect into
+# a temp file, so the actual file replace stays a single atomic mv like the script
+# itself. Appends a sha= line if the sidecar somehow had none.
+rewrite_sidecar_sha() {
+  local file="$1" newsha="$2" line trimmed replaced=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//')"
+    case "$trimmed" in
+      '#'*) printf '%s\n' "$line" ;;
+      sha=*) printf 'sha=%s\n' "$newsha"; replaced=1 ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$file"
+  [ "$replaced" -eq 0 ] && printf 'sha=%s\n' "$newsha"
+  return 0
+}
+
+# --sync <sha|main>: explicit update, never commits/pushes.
+cmd_sync() {
+  local arg="$1" dir sidecar self
+  dir="$(script_dir)"
+  sidecar="$dir/$SIDECAR_NAME"
+  self="$(script_self_path)"
+
+  if [ ! -f "$sidecar" ]; then
+    echo "herdr-ewait: --sync: refused — no $SIDECAR_NAME sidecar found; this copy is the source, nothing to sync from" >&2
+    exit "$EXIT_SYNC_NO_SIDECAR"
+  fi
+
+  # Cheap, local, no-network refusal before anything else: never replace the script
+  # while sitting on this work tree's own default branch, and refuse a detached HEAD
+  # too (nothing to tell "default branch or not" from there).
+  if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local current default_ref default_branch
+    current="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
+    if [ -z "$current" ]; then
+      echo "herdr-ewait: --sync: refused — $dir is a git work tree with a detached HEAD; check out a branch (or use a worktree) before syncing" >&2
+      exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
+    fi
+    default_ref="$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    if [ -n "$default_ref" ]; then
+      default_branch="${default_ref#origin/}"
+    else
+      default_branch="main"
+    fi
+    if [ "$current" = "$default_branch" ]; then
+      echo "herdr-ewait: --sync: refused — $dir is on '$default_branch' (this repo's default branch); sync on a branch or in a worktree and open a PR instead" >&2
+      exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
+    fi
+  fi
+
+  case "$arg" in
+    main) : ;;
+    *)
+      if ! [[ "$arg" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "herdr-ewait: --sync: argument must be a full 40-hex-character sha, or the literal word 'main', got '$arg'" >&2
+        usage
+      fi
+      ;;
+  esac
+
+  load_sidecar "$sidecar"
+  if ! validate_sidecar_fields; then
+    echo "herdr-ewait: --sync: sidecar '$sidecar' has invalid repo/path/sha fields — refusing to use them in a fetch URL" >&2
+    exit "$EXIT_SYNC_BAD_DOWNLOAD"
+  fi
+
+  local target_sha
+  if [ "$arg" = "main" ]; then
+    target_sha="$(resolve_remote_ref "$SIDECAR_REPO" refs/heads/main || true)"
+    if [ -z "$target_sha" ]; then
+      echo "herdr-ewait: --sync: failed to resolve 'main' to a sha via git ls-remote against $SIDECAR_REPO" >&2
+      exit "$EXIT_SYNC_BAD_DOWNLOAD"
+    fi
+  else
+    target_sha="$arg"
+  fi
+
+  local tmp_script
+  tmp_script="$(mktemp "$dir/.herdr-ewait.sh.tmp.XXXXXX" 2>/dev/null)" || {
+    echo "herdr-ewait: --sync: failed to create a temp file in $dir" >&2
+    exit "$EXIT_SYNC_BAD_DOWNLOAD"
+  }
+  if ! fetch_raw "$SIDECAR_REPO" "$target_sha" "$SIDECAR_PATH" "$tmp_script"; then
+    rm -f "$tmp_script"
+    echo "herdr-ewait: --sync: refused — failed to download $SIDECAR_REPO@$target_sha:$SIDECAR_PATH" >&2
+    exit "$EXIT_SYNC_BAD_DOWNLOAD"
+  fi
+  if ! bash -n "$tmp_script" 2>/dev/null; then
+    rm -f "$tmp_script"
+    echo "herdr-ewait: --sync: refused — the downloaded file failed 'bash -n' (syntax check); not installing" >&2
+    exit "$EXIT_SYNC_BAD_DOWNLOAD"
+  fi
+
+  local added removed perm
+  added="$(diff "$self" "$tmp_script" 2>/dev/null | grep -c '^>' || true)"
+  removed="$(diff "$self" "$tmp_script" 2>/dev/null | grep -c '^<' || true)"
+  perm="$(perm_of_file "$self" || true)"
+  [ -n "$perm" ] && chmod "$perm" "$tmp_script" 2>/dev/null
+
+  # Atomic replace: write-temp-then-mv (same directory, same filesystem), so an
+  # already-running instance keeps reading its old (now-unlinked) inode undisturbed.
+  mv -f "$tmp_script" "$self"
+
+  local sidecar_tmp
+  sidecar_tmp="$(mktemp "$dir/.${SIDECAR_NAME}.tmp.XXXXXX" 2>/dev/null)" || {
+    echo "herdr-ewait: --sync: WARNING: script replaced but failed to create a temp file to rewrite the sidecar sha (it still says sha=$SIDECAR_SHA, not $target_sha)" >&2
+    exit "$EXIT_SYNC_BAD_DOWNLOAD"
+  }
+  rewrite_sidecar_sha "$sidecar" "$target_sha" > "$sidecar_tmp"
+  mv -f "$sidecar_tmp" "$sidecar"
+
+  echo "herdr-ewait: --sync: updated $self (sha $SIDECAR_SHA -> $target_sha; diff +${added:-0}/-${removed:-0} lines); sidecar sha rewritten"
+  exit 0
 }
 
 # --help / -h: full usage to STDOUT, exit 0 (a discoverable entry point so an agent can learn the
@@ -377,6 +658,13 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) print_help ;;
+    --check-source)
+      shift
+      _CS_LATEST=0
+      [ "${1:-}" = "--latest" ] && { _CS_LATEST=1; shift; }
+      cmd_check_source "$_CS_LATEST"
+      ;;
+    --sync) cmd_sync "$2" ;;
     --targets) TARGETS="$2"; shift 2 ;;
     --states) STATES="$2"; shift 2 ;;
     --log) LOG="$2"; shift 2 ;;
