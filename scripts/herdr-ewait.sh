@@ -295,8 +295,10 @@ REQUIRED:
                         unreachable instead (same as `main`), since it has nothing to
                         resolve either way. An empty entry (from a doubled or
                         trailing comma) is dropped, not resolved — an all-empty --targets
-                        is a usage error, exit 4. A pane id that DOES exist but whose agent
-                        herdr hasn't classified yet is kept as-is, not rejected — see
+                        is a usage error, exit 4; so is a --targets value containing a
+                        newline/CR, or an entry containing a '"' or '\'. A pane id that
+                        DOES exist but whose agent herdr hasn't classified yet is kept
+                        as-is, not rejected — see
                         rule 8. Wakes on whichever target moves first; the hit/stall JSON
                         line also carries this original entry back as
                         "target", alongside the resolved "pane_id".
@@ -351,8 +353,9 @@ EXIT CODES:
   3  log file missing/unreadable at start (caller falls back to `herdr agent wait`)
   4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
      an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9 — a
-     --targets with no non-empty entries left after dropping doubled/trailing commas, or
-     an unwritable --cursor-file once a run actually needs to persist one — never for a
+     --targets with no non-empty entries left after dropping doubled/trailing commas, a
+     --targets value containing a newline/CR, an entry containing a '"' or '\', or an
+     unwritable --cursor-file once a run actually needs to persist one — never for a
      run whose check-first already hits, exit 0, same as `main`)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
   6  a --targets entry could not be resolved to a pane_id — an unresolvable name
