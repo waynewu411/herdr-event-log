@@ -316,6 +316,46 @@ periodic safety-net sweep is re-checked against `herdr agent get`, so a stale
 log line cannot produce a false success. A fresh invocation starts its cursor
 at the current log size, so it never replays old history.
 
+### Vendoring: `--check-source` / `--sync`
+
+This repo is the single source of truth for `scripts/herdr-ewait.sh` — the
+script's text is repo-neutral, so a copy vendored elsewhere (e.g. into
+`edbayside/edbright-portal-core`) can be byte-identical. A vendored copy
+carries a sidecar file next to it, `herdr-ewait.source`:
+
+```
+# key=value, '#' starts a comment
+repo=waynewu411/herdr-event-log
+path=scripts/herdr-ewait.sh
+sha=<40-hex commit sha>
+```
+
+No sidecar means this copy **is** the source. Both commands are standalone,
+herdr-free, and read none of the wait-mode flags.
+
+- `herdr-ewait.sh --check-source [--latest]` — read-only, writes nothing.
+  Fetches the pinned raw content and compares its sha256 against this
+  script's own bytes. Exit `0` for a match (or no sidecar at all), `7` for a
+  drift (both hashes printed), `8` when the fetch/hash step itself fails
+  (fails closed, never reported as a match). `--latest` also resolves the
+  pinned repo's default-branch head via `git ls-remote` and exits `9` (with
+  a stderr notice) if upstream has moved past the pinned sha.
+- `herdr-ewait.sh --sync <sha|main>` — explicit update; never commits or
+  pushes. Resolves `main` to a full sha via `git ls-remote`, downloads the
+  file to a temp file in the same directory, requires it to pass `bash -n`,
+  then replaces the script atomically (write-temp-then-`mv`) and rewrites
+  the sidecar's `sha=` line the same way, printing the old/new sha and a
+  diff summary. Refuses — each with its own message and exit code — with no
+  sidecar (`10`), on the work tree's own default branch or a detached HEAD
+  (`11`, since the update must go through a branch/worktree and a PR), or on
+  a failed download/`bash -n` (`12`).
+
+Two environment variables exist **only** for tests, so they never touch the
+network: `HERDR_EWAIT_RAW_BASE_URL` overrides the
+`https://raw.githubusercontent.com` base used to fetch pinned content, and
+`HERDR_EWAIT_REMOTE_BASE_URL` overrides the `https://github.com` base used to
+resolve refs via `git ls-remote`.
+
 ## Development
 
 ```bash

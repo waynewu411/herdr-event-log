@@ -82,6 +82,23 @@
 #      way; and NOT an empty entry — those are dropped silently; an all-empty --targets
 #      is a usage error, exit 4.) The waiter
 #      never starts rather than watching a filter that can never match.
+#   7  --check-source: DRIFT — pinned source content hash mismatch (both hashes printed)
+#   8  --check-source: could not verify (fetch/network/hashing failure, or an invalid
+#      sidecar field) — fails closed, never reported as a match
+#   9  --check-source --latest: upstream has moved past the pinned sha (stderr notice)
+#   10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
+#   11 --sync: refused — this directory is a git work tree on its own default branch,
+#      or has a detached HEAD
+#   12 --sync: refused — download failed, failed `bash -n`, or the sidecar was invalid
+#
+# Vendoring (--check-source/--sync; see print_help/README for full detail): this repo
+# is the single source of truth for this script. A vendored copy carries a sidecar,
+# herdr-ewait.source (key=value: repo/path/sha), next to it — no sidecar means this
+# copy IS the source. --check-source is read-only and never calls herdr; --sync
+# replaces the file atomically (write-temp-then-mv) and rewrites the sidecar sha, but
+# never commits/pushes and refuses on the work tree's own default branch. Both are
+# dispatched directly from the argument loop, before any waiter setup, and a normal
+# wait never touches the network either way.
 #
 # Five hardening rules:
 #   1. check-first        4. verify-on-hit
@@ -564,6 +581,8 @@ USAGE:
   herdr-ewait.sh --targets "id1,id2" --log <file> --cursor-file <file> \
                  [--states "blocked|done|idle"] \
                  [--overall-timeout 3600] [--poll 5] [--safety-net 60] [--stall-after 0]
+  herdr-ewait.sh --check-source [--latest]
+  herdr-ewait.sh --sync <sha|main>
   herdr-ewait.sh --help
 
 REQUIRED:
@@ -617,15 +636,53 @@ OPTIONAL:
   value this large almost always means milliseconds); --overall-timeout must be 0 (see
   above) or a positive integer, with only a WARNING (not a usage error) past 86400s,
   since a genuine multi-day wait is plausible there in a way a multi-minute --poll never
-  is. The --poll/--safety-net
-  ceiling is checked BEFORE the ordering rule below, so it fires regardless of what the
-  other flags happen to be.
+  is. The --poll/--safety-net ceiling is checked BEFORE the ordering rule below, so it
+  fires regardless of what the other flags happen to be.
   --poll must not exceed --safety-net, which must not exceed --overall-timeout (skipped
   entirely when --overall-timeout is 0, since nothing in that case ever uses them). These
   three ordering/ceiling checks only bind a flag you actually pass: an OMITTED
   --poll/--safety-net is clamped down to fit an explicit, nonzero --overall-timeout
   instead of being rejected, so `--overall-timeout 30` alone (a short wait with
   everything else left at its default) stays valid exactly as before this rule existed.
+
+VENDORING (--check-source / --sync):
+  This repo is the single source of truth for herdr-ewait.sh. A copy vendored into
+  another repo carries a sidecar file, herdr-ewait.source, next to it: simple
+  `key=value` lines (`#` starts a comment), with keys `repo` (owner/name), `path`
+  (the file's path in that repo) and `sha` (the pinned 40-hex commit it was vendored
+  from). No sidecar means this copy IS the source. Both commands are standalone,
+  read no --targets/--log/etc., and never call herdr.
+
+  --check-source [--latest]   Read-only, writes nothing. No sidecar: reports "this
+                              copy is the source", exit 0. With a sidecar: fetches
+                              the pinned raw content and compares its sha256 against
+                              this script's own bytes — match is exit 0, a mismatch
+                              is DRIFT (exit 7, both hashes printed), and a fetch or
+                              hashing failure fails closed (exit 8, never reported as
+                              a match). --latest additionally resolves the pinned
+                              repo's default-branch head (`git ls-remote`) and exits
+                              9 (with a stderr notice) if upstream has moved past the
+                              pinned sha.
+  --sync <sha|main>            Explicit update, never commits or pushes. Resolves
+                              `main` to a full sha via `git ls-remote`, downloads the
+                              file to a temp file in the SAME directory, requires it
+                              to pass `bash -n`, then replaces this script atomically
+                              (write-temp-then-mv) and rewrites the sidecar's `sha=`
+                              line the same way — an already-running instance keeps
+                              its old (unlinked) file undisturbed. Prints the old and
+                              new sha and a diff line-count summary. Refuses (each
+                              with its own message) when there is no sidecar (exit
+                              10); when this directory is a git work tree whose
+                              current branch is the repo's own default branch, or
+                              has a detached HEAD (exit 11) — sync on a branch or in
+                              a worktree and open a PR instead; or when the download
+                              fails or fails `bash -n` (exit 12).
+
+  Test-only hooks (never set these outside a test): HERDR_EWAIT_RAW_BASE_URL
+  overrides the `https://raw.githubusercontent.com` base used to fetch pinned
+  content; HERDR_EWAIT_REMOTE_BASE_URL overrides the `https://github.com` base used
+  to resolve refs via `git ls-remote`. Both accept a local path or file:// URL so
+  tests never touch the network.
 
 EXIT CODES:
   0  hit — a target reached one of --states, verified live by `herdr agent get`
@@ -644,6 +701,15 @@ EXIT CODES:
      pane id that exists but whose agent hasn't classified yet; NOT a pane id when
      herdr is only temporarily unreachable — ridden out instead; and
      NOT an empty entry — see rule 8 and --targets above)
+  7  --check-source: DRIFT — the pinned source's content does not match this copy
+  8  --check-source: could not verify (fetch/network failure, missing sha256sum/
+     shasum, or an invalid sidecar field) — fails closed, never reported as a match
+  9  --check-source --latest: upstream has moved past the pinned sha
+  10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
+  11 --sync: refused — this directory is a git work tree on its own default branch,
+     or has a detached HEAD; sync on a branch or in a worktree instead
+  12 --sync: refused — the download failed, failed `bash -n`, or the sidecar was
+     invalid
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
   hit (exit 0):    {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>","target":"..."}
