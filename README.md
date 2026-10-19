@@ -170,7 +170,10 @@ novel risk.
 
 This repo also ships `scripts/herdr-ewait.sh`, a hardened event-log consumer
 for orchestration code. It replaces hand-rolled `tail -f`/`sleep` loops with a
-cursor-based bounded reader plus live `herdr agent get` verification:
+cursor-based bounded reader plus live `herdr agent get` verification. It has
+a sibling copy in `edbayside/edbright-portal-core`
+(`.claude/skills/deliver-with-herdr/scripts/herdr-ewait.sh`); the two are
+kept in sync (see the script's header comment):
 
 ```bash
 scripts/herdr-ewait.sh \
@@ -287,7 +290,8 @@ is missing/unreadable at start (the caller can fall back to the degraded
 `herdr agent wait` path), `4` for a usage error (bad flags, invalid
 `--states`, an invalid/out-of-range `--poll`/`--safety-net`/
 `--overall-timeout`, a `--targets` with no non-empty entries left after
-dropping doubled/trailing commas, or an unwritable `--cursor-file` once a
+dropping doubled/trailing commas, a `--targets` value containing a newline,
+a `--targets` entry containing a `"` or `\`, or an unwritable `--cursor-file` once a
 run actually needs to persist one — never for a run whose first check
 already hits), `5` for a suspected stall (only with
 `--stall-after` set), and `6` when a `--targets` entry could not be resolved
