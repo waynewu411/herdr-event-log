@@ -290,7 +290,7 @@ is missing/unreadable at start (the caller can fall back to the degraded
 `herdr agent wait` path), `4` for a usage error (bad flags, invalid
 `--states`, an invalid/out-of-range `--poll`/`--safety-net`/
 `--overall-timeout`, a `--targets` with no non-empty entries left after
-dropping doubled/trailing commas, a `--targets` value containing a newline,
+dropping doubled/trailing commas, a `--targets` value containing a newline/CR,
 a `--targets` entry containing a `"` or `\`, or an unwritable `--cursor-file` once a
 run actually needs to persist one — never for a run whose first check
 already hits), `5` for a suspected stall (only with

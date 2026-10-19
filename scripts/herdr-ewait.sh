@@ -49,7 +49,7 @@
 #      degraded `herdr agent wait` path — see references/supervision.md)
 #   4  usage error (bad/missing flag, an invalid --states token, an invalid/out-of-range
 #      --poll/--safety-net/--overall-timeout — see rule 9 below — a --targets value
-#      containing a newline, a --targets entry containing a '"' or '\', or an unwritable
+#      containing a newline/CR, a --targets entry containing a '"' or '\', or an unwritable
 #      --cursor-file once a run actually needs to persist one)
 #   5  suspected stall (only possible when --stall-after > 0; see rule 6 below), one of:
 #        - a target's `detection_content_seq` has not moved across two bracketing
@@ -296,11 +296,10 @@ REQUIRED:
                         resolve either way. An empty entry (from a doubled or
                         trailing comma) is dropped, not resolved — an all-empty --targets
                         is a usage error, exit 4; so is a --targets value containing a
-                        newline/CR, or an entry containing a '"' or '\'. A pane id that
-                        DOES exist but whose agent herdr hasn't classified yet is kept
-                        as-is, not rejected — see
-                        rule 8. Wakes on whichever target moves first; the hit/stall JSON
-                        line also carries this original entry back as
+                        newline/CR, or an entry containing a '"' or '\'. A pane id that DOES
+                        exist but whose agent herdr hasn't classified yet is kept as-is, not
+                        rejected — see rule 8. Wakes on whichever target moves first; the
+                        hit/stall JSON line also carries this original entry back as
                         "target", alongside the resolved "pane_id".
   --log <file>          The herdr-event-log file (the event bus) to consume.
   --cursor-file <file>  This waiter's own byte-cursor file (independent per consumer).
