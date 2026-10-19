@@ -597,6 +597,90 @@ func TestEwait_TargetStartingWithDash_UsageError(t *testing.T) {
 	}
 }
 
+// A --targets value carrying a raw newline or CR would have the trailing targets silently
+// dropped by the `read` builtin's split (it stops at the first newline); reject it as a
+// usage error instead, before ever resolving a target against herdr (sibling-sync note,
+// scripts/herdr-ewait.sh header).
+func TestEwait_TargetsContainingNewline_UsageError(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+
+	args := []string{
+		"--targets", "w6:p1,w6\np2",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stubConfig{}, 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit code = %d, want 4 (usage error, before ever calling herdr); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "--targets must be a single comma-separated line (newline found)") {
+		t.Fatalf("stderr missing newline-rejection message; stderr: %q", res.stderr)
+	}
+}
+
+func TestEwait_TargetsContainingCR_UsageError(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+
+	args := []string{
+		"--targets", "w6:p1,w6\rp2",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stubConfig{}, 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit code = %d, want 4 (usage error, before ever calling herdr); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "--targets must be a single comma-separated line (newline found)") {
+		t.Fatalf("stderr missing newline-rejection message; stderr: %q", res.stderr)
+	}
+}
+
+// A --targets entry is echoed back verbatim as the JSON "target" field on a hit/stall
+// line; a '"' or '\' in it would make that stdout line invalid JSON, so reject it as a
+// usage error before ever resolving the entry against herdr (sibling-sync note,
+// scripts/herdr-ewait.sh header).
+func TestEwait_TargetEntryContainingDoubleQuote_UsageError(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+
+	args := []string{
+		"--targets", `w6:p1,w6"p2`,
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stubConfig{}, 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit code = %d, want 4 (usage error, before ever calling herdr); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, `cannot appear in the JSON "target" field`) {
+		t.Fatalf("stderr missing quote/backslash-rejection message; stderr: %q", res.stderr)
+	}
+}
+
+func TestEwait_TargetEntryContainingBackslash_UsageError(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+
+	args := []string{
+		"--targets", `w6:p1,w6\p2`,
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+	}
+
+	res := runEwait(t, args, stubConfig{}, 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit code = %d, want 4 (usage error, before ever calling herdr); stdout: %q stderr: %q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, `cannot appear in the JSON "target" field`) {
+		t.Fatalf("stderr missing quote/backslash-rejection message; stderr: %q", res.stderr)
+	}
+}
+
 // --- M1: the startup diagnostic lists every target's name=pane_id mapping ---
 
 func TestEwait_TwoResolvableTargets_DiagnosticListsBothMappings(t *testing.T) {

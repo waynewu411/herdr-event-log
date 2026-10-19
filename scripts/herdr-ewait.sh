@@ -5,6 +5,12 @@
 # Hand-rolled polling (a foreground `sleep` loop, `tail -f`, or a bare `herdr agent wait`)
 # is forbidden wherever this script is available — see references/supervision.md.
 #
+# SIBLING COPY — keep in sync: edbayside/edbright-portal-core
+# .claude/skills/deliver-with-herdr/scripts/herdr-ewait.sh is a sibling of this script with
+# the same flags, exit codes, stdout JSON and stderr messages (code-identical apart from
+# help-text wording that is specific to each repo). A behaviour change to either copy must
+# be mirrored in the other.
+#
 # Usage:
 #   herdr-ewait.sh --targets "id1,id2" [--states "blocked|done|idle"] \
 #                   --log <file> --cursor-file <file> \
@@ -42,7 +48,8 @@
 #   3  log file missing/unreadable at start (caller should fall back to the
 #      degraded `herdr agent wait` path — see references/supervision.md)
 #   4  usage error (bad/missing flag, an invalid --states token, an invalid/out-of-range
-#      --poll/--safety-net/--overall-timeout — see rule 9 below — or an unwritable
+#      --poll/--safety-net/--overall-timeout — see rule 9 below — a --targets value
+#      containing a newline/CR, a --targets entry containing a '"' or '\', or an unwritable
 #      --cursor-file once a run actually needs to persist one)
 #   5  suspected stall (only possible when --stall-after > 0; see rule 6 below), one of:
 #        - a target's `detection_content_seq` has not moved across two bracketing
@@ -288,10 +295,11 @@ REQUIRED:
                         unreachable instead (same as `main`), since it has nothing to
                         resolve either way. An empty entry (from a doubled or
                         trailing comma) is dropped, not resolved — an all-empty --targets
-                        is a usage error, exit 4. A pane id that DOES exist but whose agent
-                        herdr hasn't classified yet is kept as-is, not rejected — see
-                        rule 8. Wakes on whichever target moves first; the hit/stall JSON
-                        line also carries this original entry back as
+                        is a usage error, exit 4; so is a --targets value containing a
+                        newline/CR, or an entry containing a '"' or '\'. A pane id that DOES
+                        exist but whose agent herdr hasn't classified yet is kept as-is, not
+                        rejected — see rule 8. Wakes on whichever target moves first; the
+                        hit/stall JSON line also carries this original entry back as
                         "target", alongside the resolved "pane_id".
   --log <file>          The herdr-event-log file (the event bus) to consume.
   --cursor-file <file>  This waiter's own byte-cursor file (independent per consumer).
@@ -344,8 +352,9 @@ EXIT CODES:
   3  log file missing/unreadable at start (caller falls back to `herdr agent wait`)
   4  usage error (bad/missing flag, an unknown --states token, --states with no real state,
      an invalid/out-of-range --poll, --safety-net or --overall-timeout — see rule 9 — a
-     --targets with no non-empty entries left after dropping doubled/trailing commas, or
-     an unwritable --cursor-file once a run actually needs to persist one — never for a
+     --targets with no non-empty entries left after dropping doubled/trailing commas, a
+     --targets value containing a newline/CR, an entry containing a '"' or '\', or an
+     unwritable --cursor-file once a run actually needs to persist one — never for a
      run whose check-first already hits, exit 0, same as `main`)
   5  suspected stall (only when --stall-after > 0; escalate via a worker-stall REQUEST)
   6  a --targets entry could not be resolved to a pane_id — an unresolvable name
@@ -533,6 +542,14 @@ if [ ! -r "$LOG" ]; then
   exit 3
 fi
 
+# `read` below stops at the first newline, silently dropping every later target; reject a
+# newline or CR instead (sibling-sync note above).
+case "$TARGETS" in
+  *$'\n'* | *$'\r'*)
+    echo "herdr-ewait: --targets must be a single comma-separated line (newline found)" >&2
+    usage
+    ;;
+esac
 IFS=',' read -r -a TARGET_ARR <<< "$TARGETS"
 # Trim surrounding whitespace from each target — "a, b" must match "b", not " b".
 for i in "${!TARGET_ARR[@]}"; do
@@ -569,6 +586,17 @@ for t in "${TARGET_ARR[@]}"; do
   case "$t" in
     -*)
       echo "herdr-ewait: --targets entry '$t' looks like a flag, not a pane id or herdr name" >&2
+      usage
+      ;;
+  esac
+done
+
+# An entry is echoed back verbatim as the JSON "target" field, so a '"' or '\' would make the
+# stdout line invalid JSON; reject it as a usage error (sibling-sync note above).
+for t in "${TARGET_ARR[@]}"; do
+  case "$t" in
+    *'"'* | *'\'*)
+      echo "herdr-ewait: --targets entry '$t' contains a '\"' or '\\' character, which cannot appear in the JSON \"target\" field" >&2
       usage
       ;;
   esac
