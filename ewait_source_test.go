@@ -1,7 +1,7 @@
 package main
 
 // TestCheckSource_*/TestSync_* exercise the vendoring commands added to
-// scripts/herdr-ewait.sh by issue #13 (hardened per a round-1 adversarial
+// scripts/herdr-ewait.sh by issue #13 (hardened through adversarial
 // review): --check-source [--latest] and --sync <sha|main>. Unlike
 // ewait_test.go/ewait_resolution_test.go, these never start the fake herdr
 // stub (both commands are herdr-free by design) and instead run against a
@@ -74,10 +74,11 @@ func copyScriptToDir(t *testing.T, destDir string) string {
 }
 
 // fakeUpstreamScript returns syntactically-valid, self-describing
-// herdr-ewait.sh-shaped content (so it passes --sync's M1 content checks:
-// non-empty, correct shebang, the SIDECAR_NAME sentinel, and a working
-// --help) but distinguishable from the real file via a trailing marker
-// comment, so a hash comparison correctly reports a difference.
+// herdr-ewait.sh-shaped content (so it passes --sync's content checks:
+// non-empty, correct shebang, the SIDECAR_NAME sentinel, and the trailing
+// end-of-file sentinel) but distinguishable from the real file via a
+// trailing marker comment, so a hash comparison correctly reports a
+// difference.
 func fakeUpstreamScript(t *testing.T, marker string) []byte {
 	t.Helper()
 	base := realScriptBytes(t)
@@ -165,12 +166,24 @@ func setupFakeRemote(t *testing.T, repo string) (remoteBase, firstSHA, secondSHA
 // write — no real 'origin' remote is needed) so default_branch_of() can
 // resolve the default branch name without any network access, exactly as a
 // real clone or `git remote set-head origin -a` would leave it.
+// initGitRepoWithDefaultBranch makes dir a git work tree on "main" with one
+// commit, and records refs/remotes/origin/HEAD as a REAL remote-tracking ref
+// would be (pointing at refs/remotes/origin/main, itself a real ref —
+// exactly what `git clone`/`git remote set-head origin -a` leaves behind),
+// not directly at refs/heads/main. This distinction matters for the --short
+// ambiguity tests: shortening refs/remotes/origin/HEAD when it points
+// directly at refs/heads/main is unaffected by a same-named local branch
+// (there's no "remotes/origin/" path component to begin with), so a
+// same-named branch can only reproduce that specific ambiguity against a
+// genuine remote-tracking ref.
 func initGitRepoWithDefaultBranch(t *testing.T, dir string) {
 	t.Helper()
 	gitCmd(t, dir, "init", "-q", "-b", "main")
 	gitCmd(t, dir, "add", "-A")
 	gitCmd(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init", "--allow-empty")
-	gitCmd(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/main")
+	headSHA := strings.TrimSpace(gitCmd(t, dir, "rev-parse", "HEAD"))
+	gitCmd(t, dir, "update-ref", "refs/remotes/origin/main", headSHA)
+	gitCmd(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
 }
 
 func writeExec(t *testing.T, path, content string) {
@@ -182,7 +195,7 @@ func writeExec(t *testing.T, path, content string) {
 
 // writeFakeGit/writeFakeCurl install a fully-fabricated git/curl on stubDir:
 // they log their arguments to logPath and exit 0 (git) / 1 (curl) — used
-// only to prove WHICH base URL a call targeted (the test-hook gate, M2)
+// only to prove WHICH base URL a call targeted (the test-hook gate)
 // without ever performing a real git/network operation.
 func writeFakeGit(t *testing.T, stubDir, logPath string) {
 	t.Helper()
@@ -280,13 +293,17 @@ func hermeticEnv(t *testing.T, extra ...string) []string {
 	env := []string{
 		"PATH=" + networkGuardDir(t) + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"TMPDIR=" + t.TempDir(),
-		// Belt-and-suspenders on top of the script's own git_safe scrubbing: never
-		// let a global/system gitconfig on the test machine influence a git call.
+		// GIT_CONFIG_NOSYSTEM/GIT_CONFIG_GLOBAL here are inert for any call that
+		// goes through the script's own git_safe: git_safe unsets EVERY ambient
+		// GIT_* var (including whatever this env sets) before re-setting its own
+		// specific list, which does not include GIT_CONFIG_GLOBAL — so these
+		// never actually reach git that way. HOME is the only real lever (git
+		// falls back to reading $HOME/.gitconfig once GIT_CONFIG_GLOBAL is
+		// unset), hence a fresh temp dir below rather than passing through the
+		// developer's real one.
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
-	}
-	if home := os.Getenv("HOME"); home != "" {
-		env = append(env, "HOME="+home)
+		"HOME=" + t.TempDir(),
 	}
 	return append(env, extra...)
 }
@@ -346,7 +363,7 @@ func pathWithoutGit(t *testing.T) string {
 // tool actually observed (experimentally, on this dev machine) to escape a
 // backslash-containing filename with a leading '\' when given one as an
 // argument, unlike the sha256sum build that happens to be first on PATH here.
-// Used by the L3 (sha256_of-via-stdin) regression test so it reproduces the
+// Used by the sha256_of-via-stdin regression test so it reproduces the
 // bug deterministically regardless of which hash tool a given CI machine
 // happens to prefer.
 func pathWithoutSha256sum(t *testing.T) string {
@@ -398,6 +415,36 @@ func hermeticEnvCustomPath(t *testing.T, path string, extra ...string) []string 
 func withTempHome(t *testing.T, env []string) []string {
 	t.Helper()
 	home := t.TempDir()
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HOME=") {
+			out = append(out, "HOME="+home)
+			replaced = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !replaced {
+		out = append(out, "HOME="+home)
+	}
+	return out
+}
+
+// envWithHomeGitConfig overrides env's HOME to a fresh temp dir containing a
+// ~/.gitconfig with the given content, replacing any existing HOME= entry
+// (same pattern as withTempHome). Used to simulate a real user gitconfig
+// setting — e.g. [safe] bareRepository = explicit — that the script's own
+// git_safe scrub does NOT neutralize (git_safe never sets GIT_CONFIG_GLOBAL
+// itself, and unsets any the test tried to set via its own ambient-GIT_*
+// scrub), so HOME/.gitconfig is the only way such a setting actually reaches
+// git from a test.
+func envWithHomeGitConfig(t *testing.T, env []string, gitconfig string) []string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0o644); err != nil {
+		t.Fatalf("write .gitconfig: %v", err)
+	}
 	out := make([]string, 0, len(env)+1)
 	replaced := false
 	for _, kv := range env {
@@ -600,6 +647,44 @@ func TestCheckSource_Match(t *testing.T) {
 
 	if res.exitCode != 0 {
 		t.Fatalf("exit = %d, want 0; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(strings.ToLower(res.stdout), "match") {
+		t.Errorf("stdout should report a match; got %q", res.stdout)
+	}
+}
+
+// TestCheckSource_Match_WithSafeBareRepositoryExplicit: with a
+// real user gitconfig setting [safe] bareRepository = explicit (which a
+// developer or CI runner may well have set), `git -C <bare-dir>` fails with
+// "cannot use bare repository" because `-C` only changes directory and lets
+// git DISCOVER the repo there — exactly what that setting refuses for
+// anything but an explicitly named git dir. verify_sha_on_upstream's
+// ancestry check uses a throwaway BARE scratch repo, so without
+// --git-dir instead of -C, check-source/sync would ALWAYS fail closed
+// (exit 8/12) on such a machine, never actually verifying anything.
+func TestCheckSource_Match_WithSafeBareRepositoryExplicit(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	env := envWithHomeGitConfig(t, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), "[safe]\n\tbareRepository = explicit\n")
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source"}, env, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (safe.bareRepository=explicit must not break the ancestry check's bare scratch repo); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
 	}
 	if !strings.Contains(strings.ToLower(res.stdout), "match") {
 		t.Errorf("stdout should report a match; got %q", res.stdout)
@@ -1356,7 +1441,7 @@ func TestSync_NeverExecutesDownloadedContent(t *testing.T) {
 	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
 
 	// Shebang, sentinel, and EOF sentinel all present (passes every static check),
-	// but if this were ever EXECUTED it would write a proof file — confirming M2's
+	// but if this were ever EXECUTED it would write a proof file — confirming the
 	// removal of "bash $f --help" by checking that file never appears.
 	proof := filepath.Join(dir, "proof-of-execution")
 	content := "#!/usr/bin/env bash\n" +
@@ -1375,7 +1460,7 @@ func TestSync_NeverExecutesDownloadedContent(t *testing.T) {
 		t.Fatalf("exit = %d, want 0 (content is static-valid); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
 	}
 	if _, err := os.Stat(proof); err == nil {
-		t.Fatalf("downloaded content was EXECUTED (proof file exists) — M2 regression")
+		t.Fatalf("downloaded content was EXECUTED (proof file exists) — a bash --help regression")
 	}
 }
 
@@ -1385,7 +1470,7 @@ func TestSync_Refuse_BashNGate_WithBothSentinelsPresent(t *testing.T) {
 	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
 	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
 
-	// Isolates the bash -n gate specifically: both M1 sentinels are present (so
+	// Isolates the bash -n gate specifically: both sentinels are present (so
 	// looks_like_ewait_script's static string checks alone would NOT catch this),
 	// but the content is syntactically broken.
 	content := "#!/usr/bin/env bash\n" +
@@ -1563,6 +1648,39 @@ func TestCheckSource_Latest_EmptyHeadHash(t *testing.T) {
 
 // --- --sync ---
 
+// TestSync_Success_WithSafeBareRepositoryExplicit: the --sync
+// counterpart of TestCheckSource_Match_WithSafeBareRepositoryExplicit — see
+// its doc comment for why safe.bareRepository=explicit would otherwise break
+// the ancestry check's bare scratch repo.
+func TestSync_Success_WithSafeBareRepositoryExplicit(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, oldSHA, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, oldSHA)
+
+	newContent := fakeUpstreamScript(t, "safe-bare-repository-explicit")
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, newContent)
+
+	env := envWithHomeGitConfig(t, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), "[safe]\n\tbareRepository = explicit\n")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", headSHA}, env, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (safe.bareRepository=explicit must not break the ancestry check's bare scratch repo); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	got, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(newContent) {
+		t.Errorf("script file not replaced; got %q", got)
+	}
+}
+
 func TestSync_Success_ExplicitSHA(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := copyScriptToDir(t, dir)
@@ -1728,6 +1846,63 @@ func TestSync_Refuse_OnDefaultBranch(t *testing.T) {
 
 	if res.exitCode != exitSyncOnDefaultBranch {
 		t.Fatalf("exit = %d, want %d; stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
+// TestSync_Refuse_OnDefaultBranch_WithLocalBranchNamedOriginMain and
+// TestSync_Refuse_OnDefaultBranch_WithTagNamedMain: default_branch_of
+// used `symbolic-ref --short refs/remotes/origin/HEAD` and cmd_sync used
+// `symbolic-ref --short HEAD` — `--short` abbreviates to the SHORTEST
+// UNAMBIGUOUS name, which depends on what else exists in the repo. A local
+// branch literally named "origin/main" makes refs/remotes/origin/HEAD (which
+// points at refs/remotes/origin/main) shorten to "remotes/origin/main"
+// instead of "origin/main", silently breaking the old "${ref#origin/}"
+// strip; a tag literally named "main" makes plain HEAD (refs/heads/main)
+// shorten to "heads/main" instead of "main" to disambiguate from the tag.
+// Either one broke the `current = default_branch` comparison and let --sync
+// run on the real default branch undetected. Both must still refuse (exit
+// 11) and leave the script file untouched.
+func TestSync_Refuse_OnDefaultBranch_WithLocalBranchNamedOriginMain(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir) // creates+checks out "main", current HEAD
+	// A local branch literally named "origin/main" (never checked out) is
+	// enough to make refs/remotes/origin/HEAD's --short form ambiguous.
+	gitCmd(t, dir, "branch", "origin/main")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (a local branch named origin/main must not let --sync bypass the default-branch refusal); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
+func TestSync_Refuse_OnDefaultBranch_WithTagNamedMain(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir) // creates+checks out "main", current HEAD
+	// A tag literally named "main" is enough to make HEAD's --short form
+	// ambiguous with refs/heads/main.
+	gitCmd(t, dir, "tag", "main")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (a tag named main must not let --sync bypass the default-branch refusal); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
 	}
 	after, _ := os.ReadFile(scriptPath)
 	if string(before) != string(after) {
@@ -2186,14 +2361,10 @@ func TestSync_DoesNotDisruptRunningInstance(t *testing.T) {
 	}
 }
 
-// --- Round-4 review: M1 (bare-name $0 resolution), M2 (strict arg parsing),
-// M3 (--expect-repo/--expect-path), L1 (exit 14), L2 (sidecar trim locale), L3
-// (hash-by-stdin), L6 (CDPATH decoy + dead hook bases for refusal tests) ---
-
 // TestCheckSource_Refuse_BareNameFromWrongCwd/TestSync_Refuse_BareNameFromWrongCwd
 // bash resolves a bare (no "/") script-file argument to `bash <name>` via a
 // PATH search — confirmed experimentally — but leaves $0 as the bare name, NOT the
-// resolved path. Without the M1 fix, script_self_path would resolve
+// resolved path. Without the bare-name $0 resolution fix, script_self_path would resolve
 // dirname("$0")="." against the CALLER's cwd (which has no sidecar at all here),
 // silently reporting "this copy is the source" for what is actually a drifted
 // vendored copy found only via PATH.
@@ -2548,7 +2719,7 @@ func TestSync_ExpectRepoPath(t *testing.T) {
 }
 
 // TestSync_ExpectRepoPath_OrderIndependent: the --expect-* modifiers may appear
-// BEFORE the sha|main positional too (M2's strict parser accepts either order).
+// BEFORE the sha|main positional too (the strict parser accepts either order).
 func TestSync_ExpectRepoPath_OrderIndependent(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := copyScriptToDir(t, dir)
@@ -2573,7 +2744,7 @@ func TestSync_ExpectRepoPath_OrderIndependent(t *testing.T) {
 // writeFakeMvFailingForSidecar installs an `mv` that fails ONLY when one of its
 // arguments mentions the sidecar's own name — letting the FIRST atomic replace
 // (the script file) succeed via the real mv while the SECOND (the sidecar)
-// fails, reproducing the exact window L1's exit 14 exists for.
+// fails, reproducing the exact window exit 14 exists for.
 func writeFakeMvFailingForSidecar(t *testing.T, stubDir string) {
 	t.Helper()
 	realMv, err := exec.LookPath("mv")
