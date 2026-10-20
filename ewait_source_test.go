@@ -17,6 +17,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -27,6 +29,11 @@ import (
 	"testing"
 	"time"
 )
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
 
 var sha256HexPattern = regexp.MustCompile(`[0-9a-f]{64}`)
 
@@ -201,10 +208,77 @@ func writeFakeEmptyHashTool(t *testing.T, stubDir string) {
 // change a result). TMPDIR is always a fresh t.TempDir(), never inside any
 // git repo, so verify_sha_on_upstream's scratch dir and the script's own
 // temp files never accidentally land inside a work tree.
+// networkGuardDir returns a directory containing `git` and `curl` wrapper
+// scripts that refuse (exit non-zero) any invocation whose arguments mention
+// a real upstream host (https://, github.com, or githubusercontent.com),
+// then exec the REAL binary otherwise (so a test that genuinely needs git —
+// e.g. a local-repo ancestry check — still works). hermeticEnv puts this
+// directory FIRST on PATH as defense-in-depth: even if the test-hook gate
+// (HERDR_EWAIT_TEST_HOOKS=1 + HERDR_EWAIT_*_BASE_URL) ever regressed and let
+// a call fall through to the real https://github.com/
+// https://raw.githubusercontent.com bases, this stops a test from actually
+// reaching the network — independent of git_safe's own GIT_* env scrub,
+// which this backstops rather than replaces. A test that installs its own
+// fake git/curl still wins (its stub dir is prepended in front of whatever
+// hermeticEnv/testHookEnv returned).
+func networkGuardDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, tool := range []string{"git", "curl"} {
+		real, err := exec.LookPath(tool)
+		if err != nil {
+			continue
+		}
+		script := "#!/usr/bin/env bash\n" +
+			"for a in \"$@\"; do\n" +
+			"  case \"$a\" in\n" +
+			"    *https://*|*github.com*|*githubusercontent.com*)\n" +
+			"      echo \"network-guard: refused a real-host argument: $a\" >&2\n" +
+			"      exit 17\n" +
+			"      ;;\n" +
+			"  esac\n" +
+			"done\n" +
+			"exec '" + real + "' \"$@\"\n"
+		writeExec(t, filepath.Join(dir, tool), script)
+	}
+	return dir
+}
+
+// TestNetworkGuardDir_RefusesRealHostArguments verifies the guard itself
+// : both wrapper scripts must refuse an argument naming a
+// real upstream host, and must still pass through a harmless, local-only
+// invocation (so it doesn't accidentally break every other test that relies
+// on hermeticEnv for a genuine local git/curl operation).
+func TestNetworkGuardDir_RefusesRealHostArguments(t *testing.T) {
+	dir := networkGuardDir(t)
+
+	for _, tc := range []struct {
+		tool string
+		args []string
+	}{
+		{"git", []string{"ls-remote", "https://github.com/owner/repo", "HEAD"}},
+		{"git", []string{"fetch", "https://raw.githubusercontent.com/owner/repo/sha/path"}},
+		{"curl", []string{"-fsSL", "https://raw.githubusercontent.com/owner/repo/sha/path"}},
+	} {
+		cmd := exec.Command(filepath.Join(dir, tc.tool), tc.args...)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Errorf("%s %v: want refusal (non-zero exit), got success; output=%q", tc.tool, tc.args, out)
+		}
+	}
+
+	// A harmless, local-only git invocation must still work (passthrough to
+	// the real binary) — the guard must not break genuine local git usage.
+	cmd := exec.Command(filepath.Join(dir, "git"), "--version")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("git --version: want passthrough success, got error %v; output=%q", err, out)
+	}
+}
+
 func hermeticEnv(t *testing.T, extra ...string) []string {
 	t.Helper()
 	env := []string{
-		"PATH=" + os.Getenv("PATH"),
+		"PATH=" + networkGuardDir(t) + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"TMPDIR=" + t.TempDir(),
 		// Belt-and-suspenders on top of the script's own git_safe scrubbing: never
 		// let a global/system gitconfig on the test machine influence a git call.
@@ -449,6 +523,59 @@ func TestCheckSource_SidecarIrregular_IsError(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(res.stdout), "is the source") {
 		t.Errorf("must not report 'this copy is the source' for an irregular sidecar; got %q", res.stdout)
+	}
+}
+
+// TestCheckSource_Refuse_SymlinkedSidecar/TestSync_Refuse_SymlinkedSidecar
+// : a sidecar that is ITSELF a symlink — even one resolving
+// to a genuine regular file — must be treated as irregular, the same as a
+// directory or a dangling symlink. `[ -f "$p" ]` alone follows symlinks, so
+// without an explicit `-L` check first, a symlinked sidecar pointing at a
+// real file would read as "regular": read through a symlink this script
+// doesn't control, and (for --sync) get REPLACED with a regular file
+// carrying the link's own mode bits, silently changing what the sidecar path
+// points to.
+func TestCheckSource_Refuse_SymlinkedSidecar(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	realSidecarDir := t.TempDir()
+	realSidecar := filepath.Join(realSidecarDir, "herdr-ewait.source")
+	writeSidecar(t, realSidecarDir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+	linkPath := filepath.Join(dir, "herdr-ewait.source")
+	if err := os.Symlink(realSidecar, linkPath); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source"}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (a symlinked sidecar must refuse, even one resolving to a regular file); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "not a regular file") {
+		t.Errorf("stderr should say the sidecar isn't a regular file specifically; got %q", res.stderr)
+	}
+}
+
+func TestSync_Refuse_SymlinkedSidecar(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	realSidecarDir := t.TempDir()
+	realSidecar := filepath.Join(realSidecarDir, "herdr-ewait.source")
+	writeSidecar(t, realSidecarDir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+	linkPath := filepath.Join(dir, "herdr-ewait.source")
+	if err := os.Symlink(realSidecar, linkPath); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncBadDownload {
+		t.Fatalf("exit = %d, want %d (a symlinked sidecar must refuse, even one resolving to a regular file); stdout=%q stderr=%q", res.exitCode, exitSyncBadDownload, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "not a regular file") {
+		t.Errorf("stderr should say the sidecar isn't a regular file specifically; got %q", res.stderr)
 	}
 }
 
@@ -879,7 +1006,7 @@ func TestCheckSource_RawBaseAbsolutePath_ConvertedToFileURL(t *testing.T) {
 	}
 }
 
-// --- H1: self-path resolution hardening ---
+// --- self-path resolution hardening ---
 
 func TestCheckSource_CDPathDoesNotCorruptSelfPath(t *testing.T) {
 	scriptParent := t.TempDir()
@@ -920,7 +1047,7 @@ func TestCheckSource_CDPathDoesNotCorruptSelfPath(t *testing.T) {
 	}
 }
 
-// TestCheckSource_Refuse_SymlinkedScript (round-review L3a): a bare
+// TestCheckSource_Refuse_SymlinkedScript: a bare
 // "symlink" substring check is a false-positive-pass trap here — this test's
 // own name, "TestCheckSource_Refuse_SymlinkedScript", is embedded by
 // t.TempDir() into the dead-hook-env's "unreachable" path, and lowercasing
@@ -1016,7 +1143,7 @@ func TestCheckSource_ExpectVendored_LatestOrderIndependent(t *testing.T) {
 	}
 }
 
-// --- M1: default-branch refusal / git_safe hardening ---
+// --- default-branch refusal / git_safe hardening ---
 
 // TestSync_GitSafe_ScrubsPoisonedGitEnv asserts directly on what environment
 // reaches `git`, rather than on a behavioral symptom — a poisoned var that
@@ -1171,7 +1298,7 @@ func TestSync_Refuse_DuplicateSidecarKey(t *testing.T) {
 	}
 }
 
-// --- M2: static-only content checks (bash "$f" --help removed) ---
+// --- static-only content checks (bash "$f" --help removed) ---
 
 func TestSync_Refuse_OversizedDownload(t *testing.T) {
 	dir := t.TempDir()
@@ -1281,7 +1408,7 @@ func TestSync_Refuse_BashNGate_WithBothSentinelsPresent(t *testing.T) {
 	}
 }
 
-// --- L4: --latest sub-failures, each distinctly ---
+// --- --latest sub-failures, each distinctly ---
 
 // gitPassthroughExceptLsRemote installs a `git` stub on stubDir that fails ONLY a
 // bare `ls-remote` call (used by resolve_remote_ref, i.e. --latest's own
@@ -1647,6 +1774,12 @@ func TestSync_Refuse_OriginHeadUnset_NoOrigin(t *testing.T) {
 	}
 }
 
+// TestSync_Refuse_SymlinkedScript: a bare
+// "symlink" substring check is a false-positive-pass trap — this test's own
+// name embeds "Symlinked", which lowercases to a string containing
+// "symlink" and could spuriously satisfy the assertion via an unrelated
+// message (e.g. one embedding this test's own t.TempDir() path). Anchor on
+// the exact refusal message instead.
 func TestSync_Refuse_SymlinkedScript(t *testing.T) {
 	dir := t.TempDir()
 	realPath := filepath.Join(dir, "real-herdr-ewait.sh")
@@ -1664,8 +1797,8 @@ func TestSync_Refuse_SymlinkedScript(t *testing.T) {
 	if res.exitCode != exitSyncOnDefaultBranch {
 		t.Fatalf("exit = %d, want %d (symlinked script must refuse); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
 	}
-	if !strings.Contains(strings.ToLower(res.stderr), "symlink") {
-		t.Errorf("stderr should mention the symlink; got %q", res.stderr)
+	if !strings.Contains(res.stderr, "is a symlink; sync must run against the real file, not a symlink") {
+		t.Errorf("stderr should contain the specific symlink-refusal message; got %q", res.stderr)
 	}
 }
 
@@ -1752,7 +1885,7 @@ func TestSync_Refuse_EmptyDownload(t *testing.T) {
 	}
 }
 
-// TestSync_Refuse_MissingShebang (round-review L3b): the original fixture
+// TestSync_Refuse_MissingShebang: the original fixture
 // ("echo hi\n") failed BOTH the shebang check AND the sentinel checks at
 // once, so it couldn't tell "the shebang guard caught this" from "a sentinel
 // guard would have caught it anyway" — a removed/broken shebang check would
@@ -1931,7 +2064,7 @@ func TestSync_SidecarPermissionPreserved(t *testing.T) {
 	}
 }
 
-// TestSync_Success_SidecarCommentHasInvalidUTF8Bytes (round-review L1):
+// TestSync_Success_SidecarCommentHasInvalidUTF8Bytes:
 // rewrite_sidecar_sha's leading-whitespace trim used to go through a `sed -E`
 // pipeline in the CALLER's locale — under a real UTF-8 locale, a line
 // containing invalid UTF-8 bytes (e.g. a non-ASCII comment line, perfectly
@@ -2114,7 +2247,7 @@ func TestSync_Refuse_BareNameFromWrongCwd(t *testing.T) {
 	}
 }
 
-// --- M2: strict, order-independent modifier/argument parsing ---
+// --- strict, order-independent modifier/argument parsing ---
 
 func TestCheckSource_Refuse_TypoModifier(t *testing.T) {
 	dir := t.TempDir()
@@ -2124,6 +2257,79 @@ func TestCheckSource_Refuse_TypoModifier(t *testing.T) {
 
 	if res.exitCode != 4 {
 		t.Fatalf("exit = %d, want 4 (a typo'd modifier must be a usage error, not silently ignored); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
+// TestCheckSource_Refuse_ModifierValueLooksLikeFlag/TestSync_Refuse_ModifierValueLooksLikeFlag
+// : a modifier value starting with '-' must be a usage
+// error, never silently consumed as that modifier's value — otherwise
+// `--expect-path --expect-vendored` would swallow the --expect-vendored FLAG
+// as --expect-path's VALUE, silently disabling the --expect-vendored check
+// the caller actually asked for (a false pass if the sidecar were also
+// deleted, since --expect-vendored would never fire).
+func TestCheckSource_Refuse_ModifierValueLooksLikeFlag(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	for _, args := range [][]string{
+		{"--check-source", "--expect-path", "--expect-vendored"},
+		{"--check-source", "--expect-repo", "--expect-vendored"},
+		{"--check-source", "--file", "--expect-vendored"},
+	} {
+		res := runEwaitScript(t, scriptPath, args, deadHookEnv(t), 10*time.Second)
+		if res.exitCode != 4 {
+			t.Errorf("args %v: exit = %d, want 4 (a flag-shaped value must be refused, not swallowed); stdout=%q stderr=%q", args, res.exitCode, res.stdout, res.stderr)
+		}
+	}
+}
+
+func TestSync_Refuse_ModifierValueLooksLikeFlag(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	sha := strings.Repeat("a", 40)
+
+	for _, args := range [][]string{
+		{"--sync", sha, "--expect-path", "--expect-repo"},
+		{"--sync", sha, "--expect-repo", "--expect-path"},
+	} {
+		res := runEwaitScript(t, scriptPath, args, deadHookEnv(t), 10*time.Second)
+		if res.exitCode != 4 {
+			t.Errorf("args %v: exit = %d, want 4 (a flag-shaped value must be refused, not swallowed); stdout=%q stderr=%q", args, res.exitCode, res.stdout, res.stderr)
+		}
+	}
+}
+
+// TestCheckSource_Refuse_RepeatedModifier/TestSync_Refuse_RepeatedModifier
+// : a repeated modifier is a usage error, not last-wins.
+func TestCheckSource_Refuse_RepeatedModifier(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	for _, args := range [][]string{
+		{"--check-source", "--expect-repo", "a/b", "--expect-repo", "c/d"},
+		{"--check-source", "--expect-path", "a/b.sh", "--expect-path", "c/d.sh"},
+		{"--check-source", "--file", "/tmp/a.sh", "--file", "/tmp/b.sh"},
+	} {
+		res := runEwaitScript(t, scriptPath, args, deadHookEnv(t), 10*time.Second)
+		if res.exitCode != 4 {
+			t.Errorf("args %v: exit = %d, want 4 (a repeated modifier must be refused, not last-wins); stdout=%q stderr=%q", args, res.exitCode, res.stdout, res.stderr)
+		}
+	}
+}
+
+func TestSync_Refuse_RepeatedModifier(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	sha := strings.Repeat("a", 40)
+
+	for _, args := range [][]string{
+		{"--sync", sha, "--expect-repo", "a/b", "--expect-repo", "c/d"},
+		{"--sync", sha, "--expect-path", "a/b.sh", "--expect-path", "c/d.sh"},
+	} {
+		res := runEwaitScript(t, scriptPath, args, deadHookEnv(t), 10*time.Second)
+		if res.exitCode != 4 {
+			t.Errorf("args %v: exit = %d, want 4 (a repeated modifier must be refused, not last-wins); stdout=%q stderr=%q", args, res.exitCode, res.stdout, res.stderr)
+		}
 	}
 }
 
@@ -2155,7 +2361,7 @@ func TestSync_Refuse_ExtraArgumentAfterSha(t *testing.T) {
 	}
 }
 
-// --- M3: --expect-repo/--expect-path ---
+// --- --expect-repo/--expect-path ---
 
 func TestCheckSource_ExpectRepoPath(t *testing.T) {
 	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
@@ -2362,7 +2568,7 @@ func TestSync_ExpectRepoPath_OrderIndependent(t *testing.T) {
 	}
 }
 
-// --- L1: exit 14, PARTIALLY APPLIED ---
+// --- exit 14, PARTIALLY APPLIED ---
 
 // writeFakeMvFailingForSidecar installs an `mv` that fails ONLY when one of its
 // arguments mentions the sidecar's own name — letting the FIRST atomic replace
@@ -2430,7 +2636,7 @@ func TestSync_PartiallyApplied_ExitCode14(t *testing.T) {
 	}
 }
 
-// --- L2: load_sidecar trim must be locale-stable, never silently skip a line ---
+// --- load_sidecar trim must be locale-stable, never silently skip a line ---
 
 // availableUTF8Locale returns the first UTF-8 locale name `locale -a` lists
 // (preferring en_US.UTF-8), or "" if none is installed on this machine.
@@ -2457,7 +2663,7 @@ func availableUTF8Locale(t *testing.T) string {
 	return ""
 }
 
-// TestCheckSource_Refuse_SidecarInvalidUTF8Line (round-review L3c): pins
+// TestCheckSource_Refuse_SidecarInvalidUTF8Line: pins
 // LANG/LC_ALL to a real UTF-8 locale in the CHILD's environment (not just
 // relying on hermeticEnv's minimal env defaulting to the POSIX/C locale,
 // which would never have exercised the original sed-under-UTF-8 bug at all)
@@ -2495,7 +2701,7 @@ func TestCheckSource_Refuse_SidecarInvalidUTF8Line(t *testing.T) {
 	}
 }
 
-// --- L3: sha256_of must hash via stdin, never by filename argument ---
+// --- sha256_of must hash via stdin, never by filename argument ---
 
 func TestCheckSource_Match_PathContainsBackslash(t *testing.T) {
 	parent := t.TempDir()
@@ -2529,7 +2735,7 @@ func TestCheckSource_Match_PathContainsBackslash(t *testing.T) {
 	}
 }
 
-// --- L6: CDPATH must never hijack resolution to a decoy directory ---
+// --- CDPATH must never hijack resolution to a decoy directory ---
 
 func TestCheckSource_CDPathDecoyDirectory_DoesNotHijackResolution(t *testing.T) {
 	scriptParent := t.TempDir()
@@ -2617,6 +2823,86 @@ func TestCheckSource_File_Match(t *testing.T) {
 	}
 }
 
+// TestCheckSource_File_TrustedMatchesPinned_TargetModified_Drift and
+// TestCheckSource_File_TrustedModified_TargetMatchesPinned:
+// every --file test above used a trusted copy byte-identical to the --file
+// target, so a mutant that hashes $0 (the trusted copy) instead of $self (the
+// --file target) survives unnoticed — the whole point of --file is to let a
+// TRUSTED copy check an UNTRUSTED one, so the trusted and target bytes must
+// differ to actually exercise which one gets hashed as "local".
+func TestCheckSource_File_TrustedMatchesPinned_TargetModified_Drift(t *testing.T) {
+	trustedDir := t.TempDir()
+	trustedScript := copyScriptToDir(t, trustedDir) // trusted copy == the real (pinned) bytes
+
+	targetDir := t.TempDir()
+	targetScript := copyScriptToDir(t, targetDir)
+	tamperedTarget := fakeUpstreamScript(t, "tampered-target")
+	if err := os.WriteFile(targetScript, tamperedTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, targetDir, fakeRepo, fakeScriptRelPath, headSHA)
+	rawBase := t.TempDir()
+	// Pin content equals the TRUSTED copy's bytes (the real upstream source) —
+	// the --file TARGET has silently drifted away from it.
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, realScriptBytes(t))
+
+	res := runEwaitScript(t, trustedScript, []string{"--check-source", "--file", targetScript}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceDrift {
+		t.Fatalf("exit = %d, want %d (DRIFT: the --file target, not the trusted copy, has diverged from the pin); stdout=%q stderr=%q", res.exitCode, exitCheckSourceDrift, res.stdout, res.stderr)
+	}
+
+	// The printed "local" hash must specifically be the --file TARGET's hash —
+	// a mutant hashing $0 (the trusted copy, which equals the pin) instead of
+	// $self would print the TRUSTED copy's hash here, which would equal the
+	// pinned hash and wrongly report exit 0 "match" instead of DRIFT.
+	wantLocalHash := sha256Hex(tamperedTarget)
+	hashes := sha256HexPattern.FindAllString(res.stderr, -1)
+	if len(hashes) < 1 {
+		t.Fatalf("expected at least one sha256 hash printed on DRIFT; stderr=%q", res.stderr)
+	}
+	if hashes[0] != wantLocalHash {
+		t.Errorf("printed local hash = %s, want the --file TARGET's hash %s (hashed the trusted copy's own $0 instead of --file's target?); stderr=%q", hashes[0], wantLocalHash, res.stderr)
+	}
+}
+
+func TestCheckSource_File_TrustedModified_TargetMatchesPinned(t *testing.T) {
+	trustedDir := t.TempDir()
+	trustedScript := copyScriptToDir(t, trustedDir)
+	// Modify the TRUSTED copy itself — the match/drift decision must depend
+	// only on the --file TARGET, never on the trusted copy's own bytes.
+	modifiedTrusted := fakeUpstreamScript(t, "trusted-itself-modified")
+	if err := os.WriteFile(trustedScript, modifiedTrusted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	targetScript := copyScriptToDir(t, targetDir) // target == the real (pinned) bytes
+	targetBytes, err := os.ReadFile(targetScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, targetDir, fakeRepo, fakeScriptRelPath, headSHA)
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, targetBytes)
+
+	res := runEwaitScript(t, trustedScript, []string{"--check-source", "--file", targetScript}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (the --file TARGET matches the pin even though the trusted copy's own bytes differ from it); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
 func TestCheckSource_File_Drift(t *testing.T) {
 	trustedDir := t.TempDir()
 	trustedScript := copyScriptToDir(t, trustedDir)
@@ -2694,6 +2980,33 @@ func TestCheckSource_File_Refuse_NonexistentPath(t *testing.T) {
 
 	if res.exitCode != exitCheckSourceFail {
 		t.Fatalf("exit = %d, want %d (a nonexistent --file target must fail closed); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+}
+
+// TestCheckSource_Refuse_FileAsLastArg/TestCheckSource_Refuse_FileEmptyValue
+// : --file with no value at all (it's the last argument) or
+// an explicit empty-string value must be a usage error, not silently treated
+// as "no --file given" (which would fall back to checking $0 instead of
+// failing the caller's request closed).
+func TestCheckSource_Refuse_FileAsLastArg(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--file"}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit = %d, want 4 (--file with no value must be a usage error); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
+func TestCheckSource_Refuse_FileEmptyValue(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--file", ""}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != 4 {
+		t.Fatalf("exit = %d, want 4 (--file \"\" must be a usage error); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
 	}
 }
 

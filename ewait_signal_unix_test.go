@@ -186,6 +186,66 @@ func TestSync_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
 	}
 }
 
+// TestCheckSource_SIGTERM_CleansUpAndExitsNonZero: proves
+// cmd_check_source ALSO installs the vendoring traps (not just cmd_sync) —
+// a SIGTERM delivered while --check-source is blocked in its own fetch step
+// must stop it (128+signal) and leave no herdr-ewait.check-source.* temp
+// file behind, the same guarantee TestSync_SIGTERM_CleansUpAndExitsNonZero
+// already proves for --sync.
+func TestCheckSource_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	stubDir := t.TempDir()
+	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\nsleep 30\n")
+
+	tmpDir := t.TempDir()
+	env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
+	for i, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "PATH="):
+			env[i] = "PATH=" + stubDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+		case strings.HasPrefix(kv, "TMPDIR="):
+			env[i] = "TMPDIR=" + tmpDir
+		}
+	}
+
+	proc := startEwaitAt(t, scriptPath, []string{"--check-source"}, env)
+	time.Sleep(700 * time.Millisecond) // let it reach the (trap-armed) fetch step
+
+	if !hasCheckSourceTempFile(t, tmpDir) {
+		t.Fatalf("expected a herdr-ewait.check-source.* temp file to exist before SIGTERM (trap not yet armed?)")
+	}
+
+	if err := syscall.Kill(-proc.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM to process group: %v", err)
+	}
+
+	res := proc.wait(t, 10*time.Second)
+	if res.exitCode != 143 {
+		t.Fatalf("exit = %d, want 143 (128+SIGTERM) after cleanup; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if hasCheckSourceTempFile(t, tmpDir) {
+		t.Errorf("leftover herdr-ewait.check-source.* temp file after SIGTERM cleanup")
+	}
+}
+
+func hasCheckSourceTempFile(t *testing.T, dir string) bool {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "herdr-ewait.check-source.") {
+			return true
+		}
+	}
+	return false
+}
+
 // TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir: the ancestry
 // scratch dir created by verify_sha_on_upstream must be registered for cleanup
 // too, not just check-source's/sync's own temp files — a SIGTERM delivered
