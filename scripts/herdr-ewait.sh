@@ -5,10 +5,10 @@
 # Hand-rolled polling (a foreground `sleep` loop, `tail -f`, or a bare `herdr agent wait`)
 # is forbidden wherever this script is available.
 #
-# Vendorable: this file's own text names no repo but this one. A copy vendored
-# elsewhere carries a herdr-ewait.source sidecar (see the "Vendoring" section below)
-# naming which repo/path/sha it is pinned to; that named repo (or this copy itself,
-# when there is no sidecar) is the source of truth.
+# Vendorable: this file's own text does not name any specific repository. A copy
+# vendored elsewhere carries a herdr-ewait.source sidecar (see the "Vendoring" section
+# below) naming which repo/path/sha it is pinned to; that named repo (or this copy
+# itself, when there is no sidecar) is the source of truth.
 #
 # Usage:
 #   herdr-ewait.sh --targets "id1,id2" [--states "blocked|done|idle"] \
@@ -83,20 +83,21 @@
 #      never starts rather than watching a filter that can never match.
 #   7  --check-source: DRIFT — pinned source content hash mismatch (both hashes printed)
 #   8  --check-source: could not verify (fetch/network/hashing/ancestry-check failure,
-#      an invalid sidecar field, or an irregular sidecar) — fails closed, never
-#      reported as a match
+#      a malformed/invalid sidecar field, an irregular sidecar, or this copy itself
+#      being a symlink) — fails closed, never reported as a match
 #   9  --check-source --latest: upstream has moved past the pinned sha AND the file's
 #      own content differs (stderr notice; a commit-only move is exit 0)
 #   10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
 #   11 --sync: refused — the script path is a symlink; this directory is a git work
 #      tree on its own default branch (or that branch can't be determined); it has a
-#      detached HEAD; or git is unavailable while an ancestor directory still looks
-#      like a git work tree
-#   12 --sync: refused — an irregular/invalid sidecar, a failed ancestry check, a
-#      failed download, or a downloaded file that fails `bash -n` or doesn't look
-#      like a genuine herdr-ewait.sh
+#      detached HEAD; or git is unavailable, or failed to introspect the tree, while
+#      an ancestor directory still looks like a git work tree
+#   12 --sync: refused — a malformed/irregular/invalid sidecar, a failed ancestry
+#      check, a failed download, or a downloaded file that fails `bash -n` or doesn't
+#      look like a genuine herdr-ewait.sh
+#   13 --check-source --expect-vendored: no sidecar found (expected a vendored copy)
 #
-# Vendoring (--check-source/--sync; see print_help/README for full detail): the repo
+# Vendoring (--check-source/--sync; see print_help for full detail): the repo
 # named in a vendored copy's sidecar — or this copy itself, when there is no sidecar —
 # is the source of truth for this script's text. A vendored copy carries a sidecar,
 # herdr-ewait.source (key=value: repo/path/sha), next to it — no sidecar means this
@@ -296,13 +297,15 @@ readonly EXIT_CHECK_SOURCE_UPSTREAM_NEWER=9
 readonly EXIT_SYNC_NO_SIDECAR=10
 readonly EXIT_SYNC_ON_DEFAULT_BRANCH=11
 readonly EXIT_SYNC_BAD_DOWNLOAD=12
+readonly EXIT_CHECK_SOURCE_EXPECT_VENDORED=13
 readonly SIDECAR_NAME="herdr-ewait.source"
 readonly RAW_BASE_DEFAULT="https://raw.githubusercontent.com"
 readonly REMOTE_BASE_DEFAULT="https://github.com"
+readonly SYNC_SCRIPT_MAX_BYTES=1048576   # 1 MiB size cap on a downloaded script
 
 usage() {
   echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N] [--stall-after N]" >&2
-  echo "       herdr-ewait.sh --check-source [--latest]" >&2
+  echo "       herdr-ewait.sh --check-source [--latest] [--expect-vendored]" >&2
   echo "       herdr-ewait.sh --sync <sha|main>" >&2
   echo "run '$0 --help' for full usage" >&2
   exit 4
@@ -313,22 +316,47 @@ usage() {
 # entry point (cmd_check_source, cmd_sync) always exits itself, on every path.
 
 # Resolves $0 to an absolute path, even when invoked via a relative path (tests always
-# pass an absolute path, but a real caller may not).
+# pass an absolute path, but a real caller may not). `unset CDPATH; cd -P -- ...
+# >/dev/null` guards two things at once (in a subshell, via $(...), so the unset
+# never escapes to the rest of the script): an exported CDPATH can make `cd` on a
+# relative dirname print the directory it matched to STDOUT (corrupting this command
+# substitution with an extra line — silently misresolving the sidecar path), and `-P`
+# resolves symlinks in the DIRECTORY portion only, never the final path component, so
+# a symlinked $0 itself still reads back as a symlink for the checks below.
 script_self_path() {
   case "$0" in
     /*) printf '%s\n' "$0" ;;
-    *) printf '%s\n' "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+    *)
+      local dir
+      dir="$(unset CDPATH; cd -P -- "$(dirname -- "$0")" >/dev/null && pwd -P)" || return 1
+      printf '%s/%s\n' "$dir" "$(basename -- "$0")"
+      ;;
   esac
 }
 
 script_dir() { dirname "$(script_self_path)"; }
 
-# Runs git with every repo-discovery env var that could silently redirect `-C <dir>`
-# to a different repository unset first (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/
-# GIT_COMMON_DIR) — an inherited GIT_DIR in the caller's environment must never make
-# the default-branch/ancestry checks below look at the wrong repo.
+# Runs git with every GIT_* env var unset (not just the obvious repo-discovery ones —
+# an inherited GIT_DIR, GIT_CEILING_DIRECTORIES, GIT_CONFIG_*, etc. in the caller's
+# environment must never redirect or reconfigure the default-branch/ancestry checks
+# below), plus GIT_CONFIG_NOSYSTEM=1 (ignore /etc/gitconfig) and GIT_TERMINAL_PROMPT=0
+# (never block waiting for a credential prompt) and conservative network timeouts.
 git_safe() {
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR git "$@"
+  local unset_args=() var
+  while IFS= read -r var; do
+    [ -n "$var" ] && unset_args+=(-u "$var")
+  done < <(compgen -e | grep '^GIT_' || true)
+  # "${unset_args[@]}" on a genuinely empty array is itself an "unbound variable"
+  # error under `set -u` on bash < 4.4 (e.g. macOS's bundled bash 3.2) — the same
+  # pitfall documented elsewhere in this file; guard by length before spreading it.
+  if [ "${#unset_args[@]}" -gt 0 ]; then
+    env "${unset_args[@]}" \
+      GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+      git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+  else
+    env GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+      git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+  fi
 }
 
 # Test hooks (HERDR_EWAIT_RAW_BASE_URL / HERDR_EWAIT_REMOTE_BASE_URL) are honoured
@@ -337,22 +365,25 @@ git_safe() {
 # set this outside a test.
 test_hooks_active() { [ "${HERDR_EWAIT_TEST_HOOKS:-}" = "1" ]; }
 
-# A test-hook override must be file://, an absolute local path, or http://127.0.0.1
-# / http://localhost (optionally with :<port>) — never an arbitrary scheme/host, so a
-# stray env var can't silently redirect a real run at an attacker-controlled server.
+# A test-hook override must be file://, an absolute local path, or EXACTLY
+# http://127.0.0.1 or http://localhost (optionally :<port>, optionally /<path>) — no
+# userinfo/'@' and nothing else in the authority, so e.g. "http://localhost:1@evil.
+# example" (a glob like "localhost:[0-9]*" would wrongly accept this) is rejected, not
+# just an arbitrary scheme/host. LC_ALL=C keeps the regex byte-exact across locales.
 validate_test_override_url() {
+  local LC_ALL=C
   case "$1" in
-    file://*) return 0 ;;
-    /*) return 0 ;;
-    http://127.0.0.1 | http://127.0.0.1:[0-9]*) return 0 ;;
-    http://localhost | http://localhost:[0-9]*) return 0 ;;
-    *) return 1 ;;
+    file://* | /*) return 0 ;;
   esac
+  [[ "$1" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$ ]]
 }
 
 # Resolves the raw-content base URL: the HERDR_EWAIT_RAW_BASE_URL test hook only when
 # test_hooks_active and it validates, with a stderr warning every time it is used;
 # otherwise (including when the var is set but the gate is off) always the real base.
+# curl needs an actual URL, so a bare absolute path is converted to file:// here —
+# git (resolve_remote_base below) accepts a bare path natively and needs no such
+# conversion.
 resolve_raw_base() {
   if test_hooks_active && [ -n "${HERDR_EWAIT_RAW_BASE_URL:-}" ]; then
     if ! validate_test_override_url "$HERDR_EWAIT_RAW_BASE_URL"; then
@@ -360,7 +391,10 @@ resolve_raw_base() {
       return 1
     fi
     echo "herdr-ewait: WARNING: test override active: base=$HERDR_EWAIT_RAW_BASE_URL (HERDR_EWAIT_RAW_BASE_URL)" >&2
-    printf '%s' "$HERDR_EWAIT_RAW_BASE_URL"
+    case "$HERDR_EWAIT_RAW_BASE_URL" in
+      /*) printf 'file://%s' "$HERDR_EWAIT_RAW_BASE_URL" ;;
+      *) printf '%s' "$HERDR_EWAIT_RAW_BASE_URL" ;;
+    esac
     return 0
   fi
   printf '%s' "$RAW_BASE_DEFAULT"
@@ -399,8 +433,13 @@ sidecar_state() {
 SIDECAR_REPO=""
 SIDECAR_PATH=""
 SIDECAR_SHA=""
+# Returns 1 (fail closed) on a duplicate key, an unknown key, or any non-blank line
+# that isn't a comment or a recognized key=value — a sidecar is small and fully under
+# this script's own control, so there is no reason to silently ignore (last-wins) or
+# tolerate anything unexpected in it.
 load_sidecar() {
   local file="$1" line trimmed key value
+  local seen_repo=0 seen_path=0 seen_sha=0
   while IFS= read -r line || [ -n "$line" ]; do
     trimmed="$(printf '%s' "${line%%#*}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     [ -z "$trimmed" ] && continue
@@ -409,19 +448,30 @@ load_sidecar() {
         key="${trimmed%%=*}"
         value="${trimmed#*=}"
         case "$key" in
-          repo) SIDECAR_REPO="$value" ;;
-          path) SIDECAR_PATH="$value" ;;
-          sha) SIDECAR_SHA="$value" ;;
+          repo)
+            [ "$seen_repo" -eq 1 ] && return 1
+            seen_repo=1
+            SIDECAR_REPO="$value"
+            ;;
+          path)
+            [ "$seen_path" -eq 1 ] && return 1
+            seen_path=1
+            SIDECAR_PATH="$value"
+            ;;
+          sha)
+            [ "$seen_sha" -eq 1 ] && return 1
+            seen_sha=1
+            SIDECAR_SHA="$value"
+            ;;
+          *) return 1 ;;
         esac
         ;;
+      *) return 1 ;;
     esac
   done < "$file"
+  return 0
 }
 
-# Sidecar fields are attacker-controllable (anyone who can edit the vendored copy's
-# sidecar) and get spliced straight into a fetch URL — validate strictly before using
-# any of them, reject otherwise. repo: owner/name, each half [A-Za-z0-9_.-]+ only. path:
-# no leading '/', no '..' segment. sha: exactly 40 lowercase hex.
 # Strict (LC_ALL=C, so byte-range character classes behave the same in every locale):
 # repo is owner/name, each half starting with an alnum and then alnum/_.-; path has no
 # leading '/', no '..' or empty ('//') segment, and only alnum/_./- characters,
@@ -468,7 +518,8 @@ fetch_raw() {
   base="$(resolve_raw_base)" || return 1
   proto="https"
   test_hooks_active && proto="https,file,http"
-  curl -fsSL --proto "=$proto" "$base/$repo/$sha/$path" -o "$out" 2>/dev/null
+  curl -fsSL --proto "=$proto" --connect-timeout 10 --max-time 60 \
+    "$base/$repo/$sha/$path" -o "$out" 2>/dev/null
 }
 
 # Resolves $2 (a ref, e.g. "HEAD" or "refs/heads/main") of https://github.com/<repo>
@@ -524,12 +575,24 @@ verify_sha_on_upstream() {
 
 # --check-source [--latest]: read-only, no herdr calls, writes nothing.
 cmd_check_source() {
-  local latest="$1" dir sidecar state
+  local latest="$1" expect_vendored="$2" dir sidecar state self
+  self="$(script_self_path)"
+  # Same rule as --sync: a symlinked $0 would resolve this copy's own identity (and
+  # script_dir()'s sidecar lookup) to wherever the symlink happens to live, not
+  # wherever the real file is — refuse rather than silently check the wrong thing.
+  if [ -L "$self" ]; then
+    echo "herdr-ewait: --check-source: refused — $self is a symlink; check-source must run against the real file, not a symlink" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  fi
   dir="$(script_dir)"
   sidecar="$dir/$SIDECAR_NAME"
   state="$(sidecar_state "$sidecar")"
 
   if [ "$state" = "absent" ]; then
+    if [ "$expect_vendored" -eq 1 ]; then
+      echo "herdr-ewait: --check-source --expect-vendored: refused — expected a vendored copy (a $SIDECAR_NAME sidecar next to $self) but none was found" >&2
+      exit "$EXIT_CHECK_SOURCE_EXPECT_VENDORED"
+    fi
     echo "herdr-ewait: this copy is the source (no $SIDECAR_NAME sidecar found)"
     exit 0
   fi
@@ -538,7 +601,10 @@ cmd_check_source() {
     exit "$EXIT_CHECK_SOURCE_FAIL"
   fi
 
-  load_sidecar "$sidecar"
+  if ! load_sidecar "$sidecar"; then
+    echo "herdr-ewait: --check-source: sidecar '$sidecar' is malformed (duplicate/unknown key, or an unparseable line) — failing closed" >&2
+    exit "$EXIT_CHECK_SOURCE_FAIL"
+  fi
   if ! validate_sidecar_fields; then
     echo "herdr-ewait: --check-source: sidecar '$sidecar' has invalid repo/path/sha fields — refusing to use them in a fetch URL" >&2
     exit "$EXIT_CHECK_SOURCE_FAIL"
@@ -567,7 +633,7 @@ cmd_check_source() {
 
   local remote_hash local_hash
   remote_hash="$(sha256_of "$tmp" || true)"
-  local_hash="$(sha256_of "$(script_self_path)" || true)"
+  local_hash="$(sha256_of "$self" || true)"
   rm -f "$tmp"
   if [ -z "$remote_hash" ] || [ -z "$local_hash" ]; then
     echo "herdr-ewait: --check-source: could not compute a sha256 hash — failing closed" >&2
@@ -642,13 +708,23 @@ rewrite_sidecar_sha() {
 # script and that it runs: non-empty, starts with the right shebang, contains a
 # sentinel string unique to this script, and executes --help successfully (no herdr
 # call, no network, fast).
+# Static checks only — this file is downloaded, unreviewed content, and must never be
+# EXECUTED before it has passed bash -n (a prior version ran `bash "$f" --help` here,
+# which is code execution before any review; removed). Non-empty, a sane size cap (a
+# real herdr-ewait.sh is a few hundred lines; 1 MiB catches a wildly oversized/garbage
+# response), the exact shebang, the sentinel used elsewhere in this file, and a
+# trailing end-of-file sentinel (added at the very bottom of this script) that a
+# truncated download would be missing.
 looks_like_ewait_script() {
-  local f="$1" first_line
+  local f="$1" first_line size
   [ -s "$f" ] || return 1
+  size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+  case "$size" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$size" -le "$SYNC_SCRIPT_MAX_BYTES" ] || return 1
   first_line="$(head -n1 "$f")"
   [ "$first_line" = "#!/usr/bin/env bash" ] || return 1
   grep -q 'SIDECAR_NAME="herdr-ewait.source"' "$f" || return 1
-  bash "$f" --help >/dev/null 2>&1
+  grep -q '^# herdr-ewait: end of file$' "$f" || return 1
 }
 
 # --sync <sha|main>: explicit update, never commits/pushes.
@@ -688,19 +764,22 @@ cmd_sync() {
   fi
 
   # Default-branch / detached-HEAD refusal: never replace the script while sitting
-  # on this work tree's own protected branch. If git itself is unavailable, don't
-  # silently skip the check — refuse if any ancestor directory looks like a git work
-  # tree at all (a `.git` entry), since there is no way to confirm it's safe.
-  if ! command -v git >/dev/null 2>&1; then
+  # on this work tree's own protected branch. Treat "git is missing" and "git is
+  # present but rev-parse itself failed" (corrupt .git/HEAD, GIT_CEILING_DIRECTORIES,
+  # an orphaned linked worktree, "dubious ownership" safe.directory, ...) exactly the
+  # same way — EITHER one silently skipping the check would fail OPEN inside a real
+  # work tree we simply couldn't introspect. Only skip the check when there is
+  # genuinely no .git anywhere above $dir.
+  if ! { command -v git >/dev/null 2>&1 && git_safe -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
     local check_dir="$dir"
     while [ -n "$check_dir" ] && [ "$check_dir" != "/" ]; do
       if [ -e "$check_dir/.git" ]; then
-        echo "herdr-ewait: --sync: refused — git is unavailable to confirm the current branch, and $check_dir looks like a git work tree (.git found); install git or sync from elsewhere" >&2
+        echo "herdr-ewait: --sync: refused — could not confirm the current branch via git (missing, or 'rev-parse --is-inside-work-tree' itself failed), and $check_dir looks like a git work tree (.git found); resolve the git issue or sync from elsewhere" >&2
         exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
       fi
       check_dir="$(dirname "$check_dir")"
     done
-  elif git_safe -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  else
     local current default_branch
     current="$(git_safe -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
     if [ -z "$current" ]; then
@@ -718,7 +797,10 @@ cmd_sync() {
     fi
   fi
 
-  load_sidecar "$sidecar"
+  if ! load_sidecar "$sidecar"; then
+    echo "herdr-ewait: --sync: sidecar '$sidecar' is malformed (duplicate/unknown key, or an unparseable line) — failing closed" >&2
+    exit "$EXIT_SYNC_BAD_DOWNLOAD"
+  fi
   if ! validate_sidecar_fields; then
     echo "herdr-ewait: --sync: sidecar '$sidecar' has invalid repo/path/sha fields — refusing to use them in a fetch URL" >&2
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
@@ -745,7 +827,13 @@ cmd_sync() {
     echo "herdr-ewait: --sync: failed to create a temp file in $dir" >&2
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
   }
-  trap 'rm -f "$tmp_script" "${sidecar_tmp:-}"' EXIT INT TERM
+  # A plain cleanup command on the INT/TERM trap would run then let the script
+  # CONTINUE from wherever it was interrupted (only EXIT's trap fires as the script
+  # is already on its way out) — explicitly exit with the conventional 128+signal
+  # code after cleanup so Ctrl-C/SIGTERM actually stop a sync in progress.
+  trap 'rm -f "$tmp_script" "${sidecar_tmp:-}"' EXIT
+  trap 'rm -f "$tmp_script" "${sidecar_tmp:-}"; exit 130' INT
+  trap 'rm -f "$tmp_script" "${sidecar_tmp:-}"; exit 143' TERM
 
   if ! fetch_raw "$SIDECAR_REPO" "$target_sha" "$SIDECAR_PATH" "$tmp_script"; then
     echo "herdr-ewait: --sync: refused — failed to download $SIDECAR_REPO@$target_sha:$SIDECAR_PATH" >&2
@@ -876,60 +964,78 @@ VENDORING (--check-source / --sync):
   `key=value` lines (`#` starts a comment), with keys `repo` (owner/name), `path`
   (the file's path in that repo) and `sha` (the pinned 40-hex commit it was vendored
   from), strictly validated before use (attacker-controllable if the sidecar is
-  edited) and never used verbatim in a URL otherwise. No sidecar means this copy IS
-  the source; a sidecar that exists but isn't a regular file (directory, dangling
-  symlink) is an error, not "no sidecar". Both commands are standalone, read no
-  --targets/--log/etc., and never call herdr. Before trusting ANY pinned/explicit
-  sha, both commands confirm it is actually reachable from the named repo's upstream
-  default branch (a throwaway local fetch + `git merge-base --is-ancestor`) — a sha
-  alone proves nothing, since GitHub's raw-content endpoint also serves fork-network
-  commits under the upstream path.
+  edited) and never used verbatim in a URL otherwise — a duplicate or unknown key, or
+  any other unparseable line, is also rejected (fail closed), not last-wins/ignored.
+  No sidecar means this copy IS the source; a sidecar that exists but isn't a regular
+  file (directory, dangling symlink) is an error, not "no sidecar" — and so is this
+  script's OWN path being a symlink (both commands refuse it). Both commands are
+  standalone, read no --targets/--log/etc., and never call herdr. Before trusting ANY
+  pinned/explicit sha, both commands confirm it is actually reachable from the named
+  repo's upstream default branch (a throwaway local fetch + `git merge-base
+  --is-ancestor`) — a sha alone proves nothing, since GitHub's raw-content endpoint
+  also serves fork-network commits under the upstream path. Every git call scrubs all
+  GIT_* env vars, sets GIT_CONFIG_NOSYSTEM=1/GIT_TERMINAL_PROMPT=0, and bounds a stall
+  connection; curl is time-bounded and protocol-restricted the same way.
 
-  --check-source [--latest]   Read-only, writes nothing. No sidecar: reports "this
-                              copy is the source", exit 0. With a sidecar: fetches
-                              the pinned raw content and compares its sha256 against
-                              this script's own bytes — match is exit 0, a mismatch
-                              is DRIFT (exit 7, both hashes printed), and a fetch,
-                              hashing, or ancestry-check failure fails closed (exit
-                              8, never reported as a match). --latest additionally
-                              resolves the pinned repo's default-branch head (`git
-                              ls-remote`) and, only if the FILE's content at that
-                              head actually differs (not just the commit), exits 9
-                              (stderr notice) — a commit-only move with unchanged
-                              content is exit 0 with an informational note.
+  --check-source [--latest] [--expect-vendored]
+                              Read-only, writes nothing. No sidecar: reports "this
+                              copy is the source", exit 0 — unless --expect-vendored
+                              was given, which turns that into exit 13 instead (so a
+                              consumer's CI can assert it's looking at a genuinely
+                              vendored copy, not an accidental source one). With a
+                              sidecar: fetches the pinned raw content and compares its
+                              sha256 against this script's own bytes — match is exit
+                              0, a mismatch is DRIFT (exit 7, both hashes printed),
+                              and a fetch, hashing, ancestry-check, or malformed/
+                              irregular-sidecar failure fails closed (exit 8, never
+                              reported as a match). --latest additionally resolves
+                              the pinned repo's default-branch head and, only if the
+                              FILE's content at that head actually differs (not just
+                              the commit), exits 9 (stderr notice) — a commit-only
+                              move with unchanged content is exit 0 with an
+                              informational note.
   --sync <sha|main>            Explicit update, never commits or pushes. Resolves
                               `main` to the named repo's resolved default-branch
                               head, downloads the file to a temp file in the SAME
                               directory, and requires it to pass `bash -n` AND look
-                              like a genuine herdr-ewait.sh (non-empty, correct
-                              shebang, a sentinel string, and a working `--help`) —
-                              `bash -n` alone accepts an empty file. Both the new
-                              script and the rewritten sidecar are fully prepared
-                              (content + permissions matched to the originals)
-                              before either atomic replace (write-temp-then-mv, same
-                              directory), so an already-running instance keeps its
-                              old (unlinked) file undisturbed, and a failure between
-                              the two replaces is reported as PARTIALLY APPLIED, not
-                              a clean refusal. Prints the old and new sha and a diff
-                              line-count summary. Refuses (each with its own
+                              like a genuine herdr-ewait.sh: non-empty, at most 1 MiB,
+                              the correct shebang, a sentinel string, and a trailing
+                              end-of-file sentinel line a truncated download would be
+                              missing (`bash -n` alone accepts an empty file; the
+                              downloaded file is never EXECUTED as part of this
+                              check). Both the new script and the rewritten sidecar
+                              are fully prepared (content + permissions matched to
+                              the originals) before either atomic replace
+                              (write-temp-then-mv, same directory), so an
+                              already-running instance keeps its old (unlinked) file
+                              undisturbed, and a failure between the two replaces is
+                              reported as PARTIALLY APPLIED, not a clean refusal;
+                              Ctrl-C/SIGTERM mid-sync clean up and exit non-zero
+                              rather than resuming. Prints the old and new sha and a
+                              diff line-count summary. Refuses (each with its own
                               message) when there is no sidecar (exit 10); when the
                               script path is itself a symlink, when this directory
                               is a git work tree whose current branch is the repo's
                               own default branch (or that branch can't be
                               determined — never guessed), when it has a detached
-                              HEAD, or when git is unavailable while an ancestor
-                              directory still looks like a git work tree (exit 11);
-                              or when the sidecar/ancestry check fails, the download
-                              fails, or the downloaded file fails `bash -n` or the
-                              herdr-ewait.sh shape checks above (exit 12).
+                              HEAD, or when git is unavailable, or fails to introspect
+                              the tree, while an ancestor directory still looks like a
+                              git work tree (exit 11); or when the sidecar is
+                              malformed/irregular/invalid, the ancestry check fails,
+                              the download fails, or the downloaded file fails
+                              `bash -n` or the herdr-ewait.sh shape checks above
+                              (exit 12).
 
   Test-only hooks, honoured ONLY when HERDR_EWAIT_TEST_HOOKS=1 is also set (never
   outside a test — every use prints a stderr WARNING): HERDR_EWAIT_RAW_BASE_URL
   overrides the `https://raw.githubusercontent.com` base used to fetch pinned
-  content; HERDR_EWAIT_REMOTE_BASE_URL overrides the `https://github.com` base used
-  to resolve refs via `git ls-remote`/`git fetch`. Each must be file://, an absolute
-  local path, or http://127.0.0.1|localhost[:port] — an arbitrary scheme/host is
-  refused, never silently honoured — so tests never touch the real network.
+  content (a bare absolute path is converted to file:// internally, since curl needs
+  an actual URL); HERDR_EWAIT_REMOTE_BASE_URL overrides the `https://github.com` base
+  used to resolve refs via `git ls-remote`/`git fetch` (git accepts a bare absolute
+  path natively, no conversion needed). Each must be file://, an absolute local path,
+  or EXACTLY http://127.0.0.1 or http://localhost (optionally :<port>, optionally a
+  path — no userinfo/'@') — an arbitrary scheme/host/authority is refused, never
+  silently honoured — so tests never touch the real network.
 
 EXIT CODES:
   0  hit — a target reached one of --states, verified live by `herdr agent get`
@@ -950,20 +1056,21 @@ EXIT CODES:
      NOT an empty entry — see rule 8 and --targets above)
   7  --check-source: DRIFT — the pinned source's content does not match this copy
   8  --check-source: could not verify (fetch/network/ancestry-check failure, missing
-     sha256sum/shasum, an invalid sidecar field, or an irregular sidecar) — fails
-     closed, never reported as a match
+     sha256sum/shasum, a malformed/invalid sidecar field, an irregular sidecar, or
+     this copy itself being a symlink) — fails closed, never reported as a match
   9  --check-source --latest: upstream has moved past the pinned sha AND the file's
      own content differs (a commit-only move with unchanged content is exit 0)
   10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
   11 --sync: refused — the script path is a symlink; this directory is a git work
      tree on its own default branch (or that branch can't be determined, never
-     guessed); it has a detached HEAD; or git is unavailable while an ancestor
-     directory still looks like a git work tree — sync on a branch or in a
-     worktree instead
-  12 --sync: refused — an irregular/invalid sidecar, a failed ancestry check, a
-     failed download, or a downloaded file that fails `bash -n` or doesn't look
-     like a genuine herdr-ewait.sh (empty, wrong shebang, missing sentinel, or a
-     failing `--help`)
+     guessed); it has a detached HEAD; or git is unavailable, or failed to
+     introspect the tree, while an ancestor directory still looks like a git work
+     tree — sync on a branch or in a worktree instead
+  12 --sync: refused — a malformed/irregular/invalid sidecar, a failed ancestry
+     check, a failed download, or a downloaded file that fails `bash -n` or doesn't
+     look like a genuine herdr-ewait.sh (empty, oversized, wrong shebang, or
+     missing a sentinel)
+  13 --check-source --expect-vendored: no sidecar found (expected a vendored copy)
 
 STDOUT (one compact JSON line — except --help/-h, which prints this help text):
   hit (exit 0):    {"pane_id":"...","verified_state":"...","ts":"<ISO8601 UTC>","target":"..."}
@@ -1005,8 +1112,15 @@ while [ $# -gt 0 ]; do
     --check-source)
       shift
       _CS_LATEST=0
-      [ "${1:-}" = "--latest" ] && { _CS_LATEST=1; shift; }
-      cmd_check_source "$_CS_LATEST"
+      _CS_EXPECT_VENDORED=0
+      while [ "${1:-}" = "--latest" ] || [ "${1:-}" = "--expect-vendored" ]; do
+        case "$1" in
+          --latest) _CS_LATEST=1 ;;
+          --expect-vendored) _CS_EXPECT_VENDORED=1 ;;
+        esac
+        shift
+      done
+      cmd_check_source "$_CS_LATEST" "$_CS_EXPECT_VENDORED"
       ;;
     --sync)
       [ -n "${2:-}" ] || { echo "herdr-ewait: --sync requires an argument: a full 40-hex sha, or the literal word 'main'" >&2; usage; }
@@ -1132,7 +1246,7 @@ if [ "$POLL" -gt "$INTERVAL_CEILING_S" ] || [ "$SAFETY_NET" -gt "$INTERVAL_CEILI
 fi
 
 # The clamp above only ever applies to an OMITTED flag — a caller who passes all three
-# explicitly (e.g. copying the README's own example verbatim and then shortening just
+# explicitly (e.g. copying a documented example verbatim and then shortening just
 # --overall-timeout) gets a real ordering violation here, not a clamp. That is
 # intentional (an explicit value is never silently overridden), but the cheapest fix is
 # usually to stop passing the default explicitly, so say that directly.
@@ -1740,3 +1854,4 @@ while :; do
 
   sleep "$POLL"
 done
+# herdr-ewait: end of file

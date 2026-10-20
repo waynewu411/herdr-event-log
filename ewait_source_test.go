@@ -17,10 +17,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,12 +31,13 @@ import (
 var sha256HexPattern = regexp.MustCompile(`[0-9a-f]{64}`)
 
 const (
-	exitCheckSourceDrift         = 7
-	exitCheckSourceFail          = 8
-	exitCheckSourceUpstreamNewer = 9
-	exitSyncNoSidecar            = 10
-	exitSyncOnDefaultBranch      = 11
-	exitSyncBadDownload          = 12
+	exitCheckSourceDrift          = 7
+	exitCheckSourceFail           = 8
+	exitCheckSourceUpstreamNewer  = 9
+	exitSyncNoSidecar             = 10
+	exitSyncOnDefaultBranch       = 11
+	exitSyncBadDownload           = 12
+	exitCheckSourceExpectVendored = 13
 )
 
 const fakeRepo = "example-owner/example-repo"
@@ -202,6 +205,10 @@ func hermeticEnv(t *testing.T, extra ...string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"TMPDIR=" + t.TempDir(),
+		// Belt-and-suspenders on top of the script's own git_safe scrubbing: never
+		// let a global/system gitconfig on the test machine influence a git call.
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
 	}
 	if home := os.Getenv("HOME"); home != "" {
 		env = append(env, "HOME="+home)
@@ -246,7 +253,7 @@ func pathWithoutGit(t *testing.T) string {
 
 func hermeticEnvCustomPath(t *testing.T, path string, extra ...string) []string {
 	t.Helper()
-	env := []string{"PATH=" + path}
+	env := []string{"PATH=" + path, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
 	if home := os.Getenv("HOME"); home != "" {
 		env = append(env, "HOME="+home)
 	}
@@ -282,6 +289,47 @@ func startEwaitAt(t *testing.T, scriptPath string, args []string, env []string) 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	return &ewaitProcess{cmd: cmd, stdout: &stdout, stderr: &stderr, done: done}
+}
+
+// runRelative runs bash with scriptRelPath (relative to dir, bash's own cwd) and
+// returns its result — for cases that must exercise bash resolving a RELATIVE $0
+// itself (the CDPATH corruption guard only applies on that path; copyScriptToDir's
+// usual absolute scriptPath bypasses it entirely).
+func runRelative(t *testing.T, dir, scriptRelPath string, args []string, env []string, timeout time.Duration) ewaitResult {
+	t.Helper()
+	requireEwaitTools(t)
+	cmd := exec.Command("bash", append([]string{scriptRelPath}, args...)...)
+	cmd.Dir = dir
+	cmd.Env = env
+	setNewProcessGroup(cmd)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	done := make(chan error, 1)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		code := 0
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				code = exitErr.ExitCode()
+			} else {
+				t.Fatalf("run: %v", err)
+			}
+		}
+		return ewaitResult{stdout: stdout.String(), stderr: stderr.String(), exitCode: code}
+	case <-time.After(timeout):
+		killProcessGroup(cmd)
+		<-done
+		t.Fatalf("timed out after %s (stdout: %q, stderr: %q)", timeout, stdout.String(), stderr.String())
+		return ewaitResult{}
+	}
 }
 
 // --- --check-source ---
@@ -592,9 +640,10 @@ func TestCheckSource_TestHookGate(t *testing.T) {
 		setGate          bool
 		wantRawSubstr    string
 		wantRemoteSubstr string
+		wantProto        string
 	}{
-		{"gate off: overrides ignored, real hosts targeted", false, "raw.githubusercontent.com", "github.com"},
-		{"gate on: local overrides honoured", true, "RAW_MARKER_XYZ", "REMOTE_MARKER_XYZ"},
+		{"gate off: overrides ignored, real hosts targeted", false, "raw.githubusercontent.com", "github.com", "--proto =https "},
+		{"gate on: local overrides honoured", true, "RAW_MARKER_XYZ", "REMOTE_MARKER_XYZ", "--proto =https,file,http "},
 	}
 
 	for _, tc := range cases {
@@ -637,12 +686,20 @@ func TestCheckSource_TestHookGate(t *testing.T) {
 			if !strings.Contains(string(logged), tc.wantRemoteSubstr) {
 				t.Errorf("git should have targeted %q; log:\n%s", tc.wantRemoteSubstr, logged)
 			}
-
-			hasWarning := strings.Contains(res.stderr, "WARNING: test override active")
-			if tc.setGate && !hasWarning {
-				t.Errorf("stderr should warn when a test override is active; got %q", res.stderr)
+			if !strings.Contains(string(logged), tc.wantProto) {
+				t.Errorf("curl should have been invoked with %q; log:\n%s", tc.wantProto, logged)
 			}
-			if !tc.setGate && hasWarning {
+
+			// Checked per-variable (not just "a warning appeared somewhere"): the
+			// raw and remote overrides are resolved by two separate functions, so a
+			// regression dropping just ONE of their warnings must not be masked by
+			// the other still firing.
+			hasRawWarning := strings.Contains(res.stderr, "WARNING: test override active") && strings.Contains(res.stderr, "(HERDR_EWAIT_RAW_BASE_URL)")
+			hasRemoteWarning := strings.Contains(res.stderr, "WARNING: test override active") && strings.Contains(res.stderr, "(HERDR_EWAIT_REMOTE_BASE_URL)")
+			if tc.setGate && !(hasRawWarning && hasRemoteWarning) {
+				t.Errorf("stderr should warn for BOTH overrides when active; got %q", res.stderr)
+			}
+			if !tc.setGate && (hasRawWarning || hasRemoteWarning) {
 				t.Errorf("stderr must not warn when the test-hook gate is off; got %q", res.stderr)
 			}
 		})
@@ -672,6 +729,588 @@ func TestCheckSource_TestHookRejectsArbitraryHost(t *testing.T) {
 	}
 	if !strings.Contains(res.stderr, "must be file://") {
 		t.Errorf("stderr should explain the allowed override forms; got %q", res.stderr)
+	}
+}
+
+func TestCheckSource_TestHookRejectsUserinfoHost(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	stubDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "calls.log")
+	writeFakeGit(t, stubDir, logPath) // ancestry must "pass" to reach raw-base resolution
+
+	env := []string{
+		"PATH=" + stubDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"TMPDIR=" + t.TempDir(),
+		"HERDR_EWAIT_TEST_HOOKS=1",
+		// A glob like "localhost:[0-9]*" would wrongly accept this; the anchored
+		// regex must not, since '@' introduces userinfo naming a different host.
+		"HERDR_EWAIT_RAW_BASE_URL=http://localhost:1@evil.example.com",
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source"}, env, 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (userinfo host must be refused); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "must be file://") {
+		t.Errorf("stderr should explain the allowed override forms; got %q", res.stderr)
+	}
+}
+
+func TestCheckSource_RawBaseAbsolutePath_ConvertedToFileURL(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	rawBase := t.TempDir() // bare absolute path, no file:// prefix
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source"}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBase,
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (a bare absolute path must work for the raw base too, converted to file:// internally); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
+// --- H1: self-path resolution hardening ---
+
+func TestCheckSource_CDPathDoesNotCorruptSelfPath(t *testing.T) {
+	scriptParent := t.TempDir()
+	const scriptSubdir = "vendored"
+	realDir := filepath.Join(scriptParent, scriptSubdir)
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := copyScriptToDir(t, realDir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, realDir, fakeRepo, fakeScriptRelPath, headSHA)
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	// CDPATH names scriptParent, so bash's `cd vendored` (inside script_self_path,
+	// since $0 is invoked as the relative "vendored/herdr-ewait.sh" below) matches
+	// via CDPATH and, without the CDPATH= guard, PRINTS the matched directory to
+	// stdout — corrupting the command substitution with an extra line, which would
+	// make sidecar_state() look in the wrong place and report "absent" instead of
+	// finding the real sidecar.
+	env := append(testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), "CDPATH="+scriptParent)
+
+	res := runRelative(t, scriptParent, filepath.Join(scriptSubdir, "herdr-ewait.sh"), []string{"--check-source"}, env, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (CDPATH must not corrupt self-path resolution); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(strings.ToLower(res.stdout), "match") {
+		t.Errorf("stdout should report a clean match, not be corrupted by a CDPATH-printed line; got %q", res.stdout)
+	}
+}
+
+func TestCheckSource_Refuse_SymlinkedScript(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real-herdr-ewait.sh")
+	if err := os.WriteFile(realPath, realScriptBytes(t), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(dir, "herdr-ewait.sh")
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	res := runEwaitScript(t, linkPath, []string{"--check-source"}, hermeticEnv(t), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (symlinked check-source must refuse, same rule as --sync); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	if !strings.Contains(strings.ToLower(res.stderr), "symlink") {
+		t.Errorf("stderr should mention the symlink; got %q", res.stderr)
+	}
+}
+
+func TestCheckSource_ExpectVendored_NoSidecar(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--expect-vendored"}, hermeticEnv(t), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceExpectVendored {
+		t.Fatalf("exit = %d, want %d (expected a vendored copy, found none); stdout=%q stderr=%q", res.exitCode, exitCheckSourceExpectVendored, res.stdout, res.stderr)
+	}
+}
+
+func TestCheckSource_ExpectVendored_WithSidecar_NormalMatch(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--expect-vendored"}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (a real sidecar present satisfies --expect-vendored); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
+func TestCheckSource_ExpectVendored_LatestOrderIndependent(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+
+	for _, args := range [][]string{
+		{"--check-source", "--expect-vendored", "--latest"},
+		{"--check-source", "--latest", "--expect-vendored"},
+	} {
+		res := runEwaitScript(t, scriptPath, args, hermeticEnv(t), 10*time.Second)
+		if res.exitCode != exitCheckSourceExpectVendored {
+			t.Errorf("args %v: exit = %d, want %d; stdout=%q stderr=%q", args, res.exitCode, exitCheckSourceExpectVendored, res.stdout, res.stderr)
+		}
+	}
+}
+
+// --- M1: default-branch refusal / git_safe hardening ---
+
+// TestSync_GitSafe_ScrubsPoisonedGitEnv asserts directly on what environment
+// reaches `git`, rather than on a behavioral symptom — a poisoned var that
+// happens to be one of the obvious four (GIT_DIR et al.) would already be
+// caught by a much narrower scrub, giving a false sense of coverage. A `git`
+// stub dumps its own environment before delegating to the real binary.
+func TestSync_GitSafe_ScrubsPoisonedGitEnv(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+	initGitRepoWithDefaultBranch(t, dir)
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not found in PATH")
+	}
+	stubDir := t.TempDir()
+	dumpPath := filepath.Join(t.TempDir(), "env-dump.txt")
+	script := "#!/usr/bin/env bash\n" +
+		"env | grep '^GIT_' >> '" + dumpPath + "' || true\n" +
+		"exec '" + realGit + "' \"$@\"\n"
+	writeExec(t, filepath.Join(stubDir, "git"), script)
+
+	env := []string{
+		"PATH=" + stubDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"TMPDIR=" + t.TempDir(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		// Not one of the "obvious four" (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/
+		// GIT_COMMON_DIR) — a scrub limited to just those would let this through.
+		"GIT_WEIRD_POISON_VAR=should-not-reach-git",
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		env = append(env, "HOME="+home)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, env, 10*time.Second)
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d ($dir is on its default branch); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+
+	dumped, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("read env dump: %v", err)
+	}
+	if strings.Contains(string(dumped), "GIT_WEIRD_POISON_VAR") {
+		t.Errorf("git_safe let GIT_WEIRD_POISON_VAR reach git — not every GIT_* var is scrubbed; dumped env:\n%s", dumped)
+	}
+	if !strings.Contains(string(dumped), "GIT_CONFIG_NOSYSTEM=1") {
+		t.Errorf("git_safe should itself set GIT_CONFIG_NOSYSTEM=1; dumped env:\n%s", dumped)
+	}
+	if !strings.Contains(string(dumped), "GIT_TERMINAL_PROMPT=0") {
+		t.Errorf("git_safe should itself set GIT_TERMINAL_PROMPT=0; dumped env:\n%s", dumped)
+	}
+}
+
+func TestSync_Refuse_RevParseFailsInsideRealTree(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir)
+	// Corrupt .git/HEAD so `git rev-parse --is-inside-work-tree` itself fails even
+	// though $dir is genuinely inside a git work tree — the "git missing" upward
+	// .git scan must ALSO cover this case, not just git being entirely absent.
+	headFile := filepath.Join(dir, ".git", "HEAD")
+	if err := os.WriteFile(headFile, []byte("not a valid HEAD file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, hermeticEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (rev-parse failing inside a real tree must still refuse, not fall open); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+}
+
+// --- sidecar parsing: fail closed on duplicate/unknown keys ---
+
+func TestCheckSource_Refuse_DuplicateSidecarKey(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	content := "repo=" + fakeRepo + "\npath=" + fakeScriptRelPath + "\nsha=" + strings.Repeat("a", 40) + "\nsha=" + strings.Repeat("b", 40) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "herdr-ewait.source"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source"}, hermeticEnv(t), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (duplicate sidecar key must fail closed, not last-wins); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	if !strings.Contains(strings.ToLower(res.stderr), "malformed") {
+		t.Errorf("stderr should say the sidecar is malformed; got %q", res.stderr)
+	}
+}
+
+func TestCheckSource_Refuse_UnknownSidecarKey(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A fully working match setup (reachable sha, matching content): if the
+	// unknown key were silently ignored instead of failing closed, this would
+	// otherwise succeed (exit 0) — isolating the guard as the sole discriminator,
+	// not relying on a shared "exit 8" bucket that an unrelated failure could also
+	// coincidentally land on.
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	content := "repo=" + fakeRepo + "\npath=" + fakeScriptRelPath + "\nsha=" + headSHA + "\nextra=whatever\n"
+	if err := os.WriteFile(filepath.Join(dir, "herdr-ewait.source"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source"}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (unknown sidecar key must fail closed, not be ignored — an otherwise-perfect match setup); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	if !strings.Contains(strings.ToLower(res.stderr), "malformed") {
+		t.Errorf("stderr should say the sidecar is malformed; got %q", res.stderr)
+	}
+}
+
+func TestSync_Refuse_DuplicateSidecarKey(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	content := "repo=" + fakeRepo + "\nrepo=another/repo\npath=" + fakeScriptRelPath + "\nsha=" + strings.Repeat("a", 40) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "herdr-ewait.source"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, hermeticEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncBadDownload {
+		t.Fatalf("exit = %d, want %d (duplicate sidecar key must fail closed); stdout=%q stderr=%q", res.exitCode, exitSyncBadDownload, res.stdout, res.stderr)
+	}
+	// exit 12 is shared with several other refusals (download/ancestry failure) —
+	// pin down the malformed-sidecar message specifically, so a last-wins
+	// regression that happens to fail later for an unrelated reason (e.g. trying
+	// to resolve/fetch "another/repo") isn't mistaken for this guard holding.
+	if !strings.Contains(strings.ToLower(res.stderr), "malformed") {
+		t.Errorf("stderr should say the sidecar is malformed; got %q", res.stderr)
+	}
+}
+
+// --- M2: static-only content checks (bash "$f" --help removed) ---
+
+func TestSync_Refuse_OversizedDownload(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	var big strings.Builder
+	big.WriteString("#!/usr/bin/env bash\n")
+	big.WriteString(`readonly SIDECAR_NAME="herdr-ewait.source"` + "\n")
+	for big.Len() < 1048576+1024 {
+		big.WriteString("# padding padding padding padding padding padding padding\n")
+	}
+	big.WriteString("# herdr-ewait: end of file\n")
+
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, []byte(big.String()))
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", headSHA}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != exitSyncBadDownload {
+		t.Fatalf("exit = %d, want %d (oversized download must be refused); stdout=%q stderr=%q", res.exitCode, exitSyncBadDownload, res.stdout, res.stderr)
+	}
+}
+
+func TestSync_Refuse_TruncatedDownload_MissingEOFSentinel(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	// Shebang + sentinel present, but missing the trailing end-of-file sentinel —
+	// simulates a response truncated mid-download.
+	content := "#!/usr/bin/env bash\n" + `readonly SIDECAR_NAME="herdr-ewait.source"` + "\necho truncated\n"
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, []byte(content))
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", headSHA}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != exitSyncBadDownload {
+		t.Fatalf("exit = %d, want %d (truncated download missing the EOF sentinel must be refused); stdout=%q stderr=%q", res.exitCode, exitSyncBadDownload, res.stdout, res.stderr)
+	}
+}
+
+func TestSync_NeverExecutesDownloadedContent(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	// Shebang, sentinel, and EOF sentinel all present (passes every static check),
+	// but if this were ever EXECUTED it would write a proof file — confirming M2's
+	// removal of "bash $f --help" by checking that file never appears.
+	proof := filepath.Join(dir, "proof-of-execution")
+	content := "#!/usr/bin/env bash\n" +
+		`readonly SIDECAR_NAME="herdr-ewait.source"` + "\n" +
+		"touch " + proof + "\n" +
+		"# herdr-ewait: end of file\n"
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, []byte(content))
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", headSHA}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (content is static-valid); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if _, err := os.Stat(proof); err == nil {
+		t.Fatalf("downloaded content was EXECUTED (proof file exists) — M2 regression")
+	}
+}
+
+func TestSync_Refuse_BashNGate_WithBothSentinelsPresent(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	// Isolates the bash -n gate specifically: both M1 sentinels are present (so
+	// looks_like_ewait_script's static string checks alone would NOT catch this),
+	// but the content is syntactically broken.
+	content := "#!/usr/bin/env bash\n" +
+		`readonly SIDECAR_NAME="herdr-ewait.source"` + "\n" +
+		"if true; then\necho unterminated\n" +
+		"# herdr-ewait: end of file\n"
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, []byte(content))
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", headSHA}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != exitSyncBadDownload {
+		t.Fatalf("exit = %d, want %d; stdout=%q stderr=%q", res.exitCode, exitSyncBadDownload, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "bash -n") {
+		t.Errorf("stderr should specifically name the bash -n failure (sentinels alone wouldn't catch this); got %q", res.stderr)
+	}
+}
+
+// --- L4: --latest sub-failures, each distinctly ---
+
+// gitPassthroughExceptLsRemote installs a `git` stub on stubDir that fails ONLY a
+// bare `ls-remote` call (used by resolve_remote_ref, i.e. --latest's own
+// default-branch-head resolution and --sync main) and delegates every other
+// subcommand (init/fetch/merge-base/etc., used by the ancestry check) to the real
+// git — isolating a ls-remote-specific failure from an ancestry-check failure, which
+// otherwise share the same remote and would fail together.
+func gitPassthroughExceptLsRemote(t *testing.T, stubDir string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not found in PATH")
+	}
+	// git_safe always prepends "-c ..." flags, so "ls-remote" is not necessarily
+	// $1 — scan every argument instead of assuming a fixed position.
+	script := "#!/usr/bin/env bash\n" +
+		"has_ls_remote=0; has_symref=0\n" +
+		"for a in \"$@\"; do\n" +
+		"  [ \"$a\" = \"ls-remote\" ] && has_ls_remote=1\n" +
+		"  [ \"$a\" = \"--symref\" ] && has_symref=1\n" +
+		"done\n" +
+		"if [ \"$has_ls_remote\" -eq 1 ] && [ \"$has_symref\" -eq 0 ]; then exit 1; fi\n" +
+		"exec '" + realGit + "' \"$@\"\n"
+	writeExec(t, filepath.Join(stubDir, "git"), script)
+}
+
+func TestCheckSource_Latest_LsRemoteFailure(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	stubDir := t.TempDir()
+	gitPassthroughExceptLsRemote(t, stubDir)
+
+	env := testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	)
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			env[i] = "PATH=" + stubDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--latest"}, env, 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (--latest's own ls-remote failing, after a successful match, must fail closed); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	// Pin down that it's specifically the empty-head_sha guard firing (not just
+	// coincidentally failing later at the head-content fetch with an empty sha
+	// spliced into the URL, which a removed guard would still often trip too).
+	if !strings.Contains(res.stderr, "failed to resolve the default-branch head") {
+		t.Errorf("stderr should name the ls-remote/head-resolution failure specifically; got %q", res.stderr)
+	}
+}
+
+func TestCheckSource_Latest_HeadFetchFailure(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, oldSHA, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, oldSHA)
+	rawBase := t.TempDir()
+	// Fixture only at oldSHA (for the match step) — none at headSHA, so the
+	// --latest content-fetch specifically fails.
+	writeRawFixture(t, rawBase, fakeRepo, oldSHA, fakeScriptRelPath, scriptBytes)
+	_ = headSHA
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--latest"}, testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	), 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (fetching the file at the upstream head must fail closed, not report upstream-newer or a false match); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+}
+
+// writeFlakyHashTool installs a `sha256sum` on stubDir that delegates to the real
+// tool for its first failAfter-1 calls, then prints nothing (exit 0) from
+// call number failAfter onward — isolates a hash failure at one specific step
+// (e.g. --latest's OWN head-content hash) from the earlier steps that must still
+// succeed normally (match's remote/local hash) for the test to be meaningful.
+func writeFlakyHashTool(t *testing.T, stubDir string, counterFile string, failAfter int) {
+	t.Helper()
+	realPath, err := exec.LookPath("sha256sum")
+	if err != nil {
+		t.Skip("sha256sum not found in PATH")
+	}
+	script := "#!/usr/bin/env bash\n" +
+		"n=0\n" +
+		"[ -f '" + counterFile + "' ] && n=$(cat '" + counterFile + "')\n" +
+		"n=$((n+1))\n" +
+		"echo \"$n\" > '" + counterFile + "'\n" +
+		"if [ \"$n\" -ge " + strconv.Itoa(failAfter) + " ]; then exit 0; fi\n" +
+		"exec '" + realPath + "' \"$@\"\n"
+	writeExec(t, filepath.Join(stubDir, "sha256sum"), script)
+}
+
+func TestCheckSource_Latest_EmptyHeadHash(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, oldSHA, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, oldSHA)
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, oldSHA, fakeScriptRelPath, scriptBytes)
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, []byte("different content at head\n"))
+
+	stubDir := t.TempDir()
+	counterFile := filepath.Join(t.TempDir(), "hash-call-counter")
+	// Calls 1-2 (remote_hash, local_hash — the match step) succeed normally; call 3
+	// (head_hash, --latest's own content hash) gets empty output.
+	writeFlakyHashTool(t, stubDir, counterFile, 3)
+
+	env := testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	)
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			env[i] = "PATH=" + stubDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+
+	res := runEwaitScript(t, scriptPath, []string{"--check-source", "--latest"}, env, 10*time.Second)
+
+	if res.exitCode != exitCheckSourceFail {
+		t.Fatalf("exit = %d, want %d (empty head-content hash must fail closed, not report a false match or upstream-newer); stdout=%q stderr=%q", res.exitCode, exitCheckSourceFail, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "could not hash the upstream-head content") {
+		t.Errorf("stderr should name the head-hash step specifically; got %q", res.stderr)
 	}
 }
 
