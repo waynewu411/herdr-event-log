@@ -15,6 +15,9 @@
 #                   --log <file> --cursor-file <file> \
 #                   [--overall-timeout 3600] [--poll 5] [--safety-net 60] \
 #                   [--stall-after 0]
+#   herdr-ewait.sh --check-source [--latest] [--expect-vendored] \
+#                   [--expect-repo owner/name] [--expect-path path] [--file path]
+#   herdr-ewait.sh --sync <sha|main> [--expect-repo owner/name] [--expect-path path]
 #   herdr-ewait.sh --help    # full usage to stdout, exit 0
 #
 # --targets accepts, per entry, anything `herdr agent get` accepts: a pane id or a unique
@@ -83,8 +86,10 @@
 #      never starts rather than watching a filter that can never match.
 #   7  --check-source: DRIFT — pinned source content hash mismatch (both hashes printed)
 #   8  --check-source: could not verify (fetch/network/hashing/ancestry-check failure,
-#      a malformed/invalid sidecar field, an irregular sidecar, or this copy itself
-#      being a symlink) — fails closed, never reported as a match
+#      a malformed/invalid sidecar field, an irregular sidecar, this copy itself
+#      being a symlink, this copy's own path failing to resolve to a regular
+#      readable file, or an invalid or mismatched --expect-repo/--expect-path) —
+#      fails closed, never reported as a match
 #   9  --check-source --latest: upstream has moved past the pinned sha AND the file's
 #      own content differs (stderr notice; a commit-only move is exit 0)
 #   10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
@@ -92,10 +97,11 @@
 #      tree on its own default branch (or that branch can't be determined); it has a
 #      detached HEAD; or git is unavailable, or failed to introspect the tree, while
 #      an ancestor directory still looks like a git work tree
-#   12 --sync: refused — a malformed/irregular/invalid sidecar, a failed ancestry
-#      check, a failed download, a downloaded file that fails `bash -n` or doesn't
-#      look like a genuine herdr-ewait.sh, or a --expect-repo/--expect-path mismatch
-#      (or invalid value)
+#   12 --sync: refused — a malformed/irregular/invalid sidecar, this copy's own
+#      path failing to resolve to a regular readable file, an invalid or
+#      mismatched --expect-repo/--expect-path, a failed ancestry check, a failed
+#      download, or a downloaded file that fails `bash -n` or doesn't look like
+#      a genuine herdr-ewait.sh
 #   13 --check-source --expect-vendored: no sidecar found (expected a vendored copy)
 #   14 --sync: PARTIALLY APPLIED — the script file was replaced but the sidecar's
 #      sha= could not be rewritten; the sidecar still names the OLD sha. Distinct
@@ -108,9 +114,13 @@
 # herdr-ewait.source (key=value: repo/path/sha), next to it — no sidecar means this
 # copy IS the source. --check-source is read-only and never calls herdr; --sync
 # replaces the file atomically (write-temp-then-mv) and rewrites the sidecar sha, but
-# never commits/pushes and refuses on the work tree's own default branch. Both are
-# dispatched directly from the argument loop, before any waiter setup, and a normal
-# wait never touches the network either way.
+# never commits/pushes and refuses on the work tree's own default branch. Both accept
+# --expect-repo/--expect-path to assert the sidecar names the expected repo/path
+# (a sidecar can only vouch for itself); --check-source additionally accepts --latest
+# (upstream-moved detection), --expect-vendored (assert a sidecar exists at all), and
+# --file PATH (check a GIVEN file/sidecar instead of $0, so a trusted copy can check an
+# untrusted one). Both are dispatched directly from the argument loop, before any
+# waiter setup, and a normal wait never touches the network either way.
 #
 # Five hardening rules:
 #   1. check-first        4. verify-on-hit
@@ -311,12 +321,21 @@ readonly SYNC_SCRIPT_MAX_BYTES=1048576   # 1 MiB size cap on a downloaded script
 
 # Registry of temp paths (check-source's own temp files, sync's temp script/
 # sidecar, verify_sha_on_upstream's ancestry scratch dir) that must be removed
-# no matter how the script exits. A single script-level EXIT/INT/TERM trap set
-# — rather than a function-local `trap ... RETURN` (unreliable across bash
-# versions when a function has multiple return paths or a signal lands mid-call)
-# or cmd_sync's own now-removed mode-specific traps — covers every one of them
-# uniformly; a path still means something to remove, an already-removed one is a
-# harmless no-op `rm -rf`.
+# no matter how the script exits. A single EXIT/INT/TERM trap set — rather than
+# a function-local `trap ... RETURN` (unreliable across bash versions when a
+# function has multiple return paths or a signal lands mid-call) or cmd_sync's
+# own now-removed mode-specific traps — covers every one of them uniformly; a
+# path still means something to remove, an already-removed one is a harmless
+# no-op `rm -rf`.
+#
+# Installed ONLY by cmd_check_source/cmd_sync (_install_vendoring_traps, called
+# at the top of each), NEVER unconditionally at script scope: a trap is only
+# ever acted on between foreground commands, so an installed INT/TERM trap
+# defers a signal until the current `sleep "$POLL"`/`herdr agent get` finishes
+# — regressing a wait-mode run's responsiveness to Ctrl-C/SIGTERM from
+# immediate to up to a full --poll interval, and changing its death from
+# death-by-signal to exit 143. Wait mode never calls either command, so it
+# installs no trap and keeps its pre-vendoring signal behavior byte-for-byte.
 _CLEANUP_PATHS=()
 _register_cleanup() { _CLEANUP_PATHS+=("$1"); }
 _cleanup_all() {
@@ -327,18 +346,20 @@ _cleanup_all() {
     done
   fi
 }
-trap '_cleanup_all' EXIT
-# A plain cleanup command on INT/TERM would run then let the script CONTINUE
-# from wherever it was interrupted (only EXIT's trap fires as the script is
-# already on its way out) — explicitly exit with the conventional 128+signal
-# code after cleanup so Ctrl-C/SIGTERM actually stop a sync (or check-source) in
-# progress rather than resuming.
-trap '_cleanup_all; exit 130' INT
-trap '_cleanup_all; exit 143' TERM
+_install_vendoring_traps() {
+  trap '_cleanup_all' EXIT
+  # A plain cleanup command on INT/TERM would run then let the script CONTINUE
+  # from wherever it was interrupted (only EXIT's trap fires as the script is
+  # already on its way out) — explicitly exit with the conventional 128+signal
+  # code after cleanup so Ctrl-C/SIGTERM actually stop a sync (or check-source)
+  # in progress rather than resuming.
+  trap '_cleanup_all; exit 130' INT
+  trap '_cleanup_all; exit 143' TERM
+}
 
 usage() {
   echo "usage: herdr-ewait.sh --targets \"id1,id2\" [--states \"blocked|done|idle\"] --log <file> --cursor-file <file> [--overall-timeout N] [--poll N] [--safety-net N] [--stall-after N]" >&2
-  echo "       herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path]" >&2
+  echo "       herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path] [--file path]" >&2
   echo "       herdr-ewait.sh --sync <sha|main> [--expect-repo owner/name] [--expect-path path]" >&2
   echo "run '$0 --help' for full usage" >&2
   exit 4
@@ -542,8 +563,8 @@ load_sidecar() {
 
 # Strict (LC_ALL=C, so byte-range character classes behave the same in every locale):
 # repo is owner/name, each half starting with an alnum and then alnum/_.-. Shared by
-# validate_sidecar_fields below AND --check-source/--sync's --expect-repo modifier
-# (M3), so both validate a repo string exactly the same way.
+# validate_sidecar_fields below AND --check-source/--sync's --expect-repo modifier,
+# so both validate a repo string exactly the same way.
 valid_repo_format() {
   local LC_ALL=C
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
@@ -551,7 +572,7 @@ valid_repo_format() {
 
 # path has no leading '/', no '..' or empty ('//') segment, and only alnum/_./-
 # characters, starting with an alnum. Shared by validate_sidecar_fields below AND
-# --check-source/--sync's --expect-path modifier (M3).
+# --check-source/--sync's --expect-path modifier.
 valid_path_format() {
   local LC_ALL=C
   case "$1" in /* | *..* | *//*) return 1 ;; esac
@@ -678,18 +699,31 @@ verify_sha_on_upstream() {
   return "$ok"
 }
 
-# --check-source [--latest] [--expect-vendored] [--expect-repo R] [--expect-path P]:
-# read-only, no herdr calls, writes nothing.
+# --check-source [--latest] [--expect-vendored] [--expect-repo R] [--expect-path P]
+# [--file PATH]: read-only, no herdr calls, writes nothing.
 cmd_check_source() {
-  local latest="$1" expect_vendored="$2" expect_repo="$3" expect_path="$4"
+  local latest="$1" expect_vendored="$2" expect_repo="$3" expect_path="$4" file_override="$5"
   local dir sidecar state self
-  if ! self="$(script_self_path)"; then
+  _install_vendoring_traps
+  if [ -n "$file_override" ]; then
+    # --file: check the GIVEN file (and its sidecar) instead of $0 — lets a
+    # TRUSTED copy of this script (e.g. extracted from a base branch) check a
+    # PR's vendored copy, so the check can't vouch for itself the way running
+    # the PR's own (possibly-edited) script against itself would. Same strict
+    # rules as the $0-derived case: regular, readable, never a symlink.
+    self="$file_override"
+    if [ ! -f "$self" ] || [ ! -r "$self" ]; then
+      echo "herdr-ewait: --check-source --file: refused — '$self' does not resolve to a regular, readable file" >&2
+      exit "$EXIT_CHECK_SOURCE_FAIL"
+    fi
+  elif ! self="$(script_self_path)"; then
     echo "herdr-ewait: --check-source: refused — could not resolve this script's own path to a regular, readable file (invoked by a bare name from a directory that doesn't actually contain it, or similar) — failing closed rather than guessing" >&2
     exit "$EXIT_CHECK_SOURCE_FAIL"
   fi
-  # Same rule as --sync: a symlinked $0 would resolve this copy's own identity (and
+  # Same rule as --sync: a symlinked target would resolve its own identity (and
   # the sidecar lookup below) to wherever the symlink happens to live, not
-  # wherever the real file is — refuse rather than silently check the wrong thing.
+  # wherever the real file is — refuse rather than silently check the wrong
+  # thing. Applies identically whether self came from $0 or --file.
   if [ -L "$self" ]; then
     echo "herdr-ewait: --check-source: refused — $self is a symlink; check-source must run against the real file, not a symlink" >&2
     exit "$EXIT_CHECK_SOURCE_FAIL"
@@ -720,7 +754,7 @@ cmd_check_source() {
     exit "$EXIT_CHECK_SOURCE_FAIL"
   fi
 
-  # M3: a sidecar vouches for itself — a look-alike fork could ship a sidecar
+  # A sidecar vouches for itself — a look-alike fork could ship a sidecar
   # naming itself as the upstream repo. --expect-repo/--expect-path let a
   # consumer's CI assert the ACTUAL expected repo/path, independent of whatever
   # the sidecar on disk claims.
@@ -827,9 +861,16 @@ cmd_check_source() {
 # a temp file, so the actual file replace stays a single atomic mv like the script
 # itself. Appends a sha= line if the sidecar somehow had none.
 rewrite_sidecar_sha() {
+  # LC_ALL=C: same reasoning as load_sidecar's trim — a sed pipeline doing this
+  # same leading-whitespace strip can hit "illegal byte sequence" under a UTF-8
+  # locale on a line with invalid bytes (e.g. a non-ASCII comment), which is an
+  # undocumented `set -e` exit 1 rather than a clean refusal. Pure bash
+  # parameter-expansion trimming has no such failure mode.
+  local LC_ALL=C
   local file="$1" newsha="$2" line trimmed replaced=0
   while IFS= read -r line || [ -n "$line" ]; do
-    trimmed="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//')"
+    trimmed="$line"
+    while [[ "$trimmed" == [[:space:]]* ]]; do trimmed="${trimmed#?}"; done
     case "$trimmed" in
       '#'*) printf '%s\n' "$line" ;;
       sha=*) printf 'sha=%s\n' "$newsha"; replaced=1 ;;
@@ -865,6 +906,7 @@ looks_like_ewait_script() {
 # commits/pushes.
 cmd_sync() {
   local arg="$1" expect_repo="$2" expect_path="$3" dir sidecar self state
+  _install_vendoring_traps
 
   case "$arg" in
     main) : ;;
@@ -944,7 +986,7 @@ cmd_sync() {
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
   fi
 
-  # M3: see cmd_check_source's matching block — a sidecar vouches for itself, so
+  # See cmd_check_source's matching block — a sidecar vouches for itself, so
   # --expect-repo/--expect-path let a consumer's CI assert the actual expected
   # repo/path independent of whatever the sidecar on disk claims.
   if [ -n "$expect_repo" ]; then
@@ -1054,7 +1096,7 @@ USAGE:
   herdr-ewait.sh --targets "id1,id2" --log <file> --cursor-file <file> \
                  [--states "blocked|done|idle"] \
                  [--overall-timeout 3600] [--poll 5] [--safety-net 60] [--stall-after 0]
-  herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path]
+  herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path] [--file path]
   herdr-ewait.sh --sync <sha|main> [--expect-repo owner/name] [--expect-path path]
   herdr-ewait.sh --help
 
@@ -1144,7 +1186,7 @@ VENDORING (--check-source / --sync):
   whatever the sidecar on disk claims; a CI check should pass
   --expect-vendored --expect-repo <owner/name> --expect-path <path> together.
 
-  --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path]
+  --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path] [--file PATH]
                               Read-only, writes nothing. No sidecar: reports "this
                               copy is the source", exit 0 — unless --expect-vendored
                               was given, which turns that into exit 13 instead (so a
@@ -1164,7 +1206,16 @@ VENDORING (--check-source / --sync):
                               content at that head actually differs (not just the
                               commit), exits 9 (stderr notice) — a commit-only move
                               with unchanged content is exit 0 with an informational
-                              note.
+                              note. --file PATH checks the GIVEN file (and reads its
+                              sidecar from the same directory) instead of this
+                              script's own $0 — the same strict rules apply to PATH as
+                              to $0 (must resolve to a regular, readable, non-symlink
+                              file; exit 8 otherwise). This lets a TRUSTED copy of
+                              herdr-ewait.sh (e.g. one extracted from a base branch)
+                              check an UNTRUSTED one (e.g. a pull request's vendored
+                              copy) without the check being able to vouch for itself
+                              the way running a PR's own possibly-edited script
+                              against itself would.
   --sync <sha|main> [--expect-repo owner/name] [--expect-path path]
                               Explicit update, never commits or pushes. --expect-repo/
                               --expect-path (if given) are checked the same way as
@@ -1195,7 +1246,8 @@ VENDORING (--check-source / --sync):
                               HEAD, or when git is unavailable, or fails to introspect
                               the tree, while an ancestor directory still looks like a
                               git work tree (exit 11); or when the sidecar is
-                              malformed/irregular/invalid, a --expect-repo/
+                              malformed/irregular/invalid, this copy's own path fails
+                              to resolve to a regular readable file, a --expect-repo/
                               --expect-path mismatch (or invalid value), the ancestry
                               check fails, the download fails, or the downloaded file
                               fails `bash -n` or the herdr-ewait.sh shape checks above
@@ -1298,7 +1350,8 @@ while [ $# -gt 0 ]; do
       _CS_EXPECT_VENDORED=0
       _CS_EXPECT_REPO=""
       _CS_EXPECT_PATH=""
-      # Strict, order-independent modifier parsing (M2): any unrecognized flag or
+      _CS_FILE=""
+      # Strict, order-independent modifier parsing: any unrecognized flag or
       # leftover positional argument is a usage error (exit 4) — a typo'd modifier
       # (e.g. --expect-vendroed) or a stray extra argument must never be silently
       # ignored the way a permissive "consume known flags, drop the rest" loop
@@ -1313,20 +1366,23 @@ while [ $# -gt 0 ]; do
           --expect-path)
             [ -n "${2:-}" ] || { echo "herdr-ewait: --check-source --expect-path requires a value" >&2; usage; }
             _CS_EXPECT_PATH="$2"; shift 2 ;;
+          --file)
+            [ -n "${2:-}" ] || { echo "herdr-ewait: --check-source --file requires a value (a path)" >&2; usage; }
+            _CS_FILE="$2"; shift 2 ;;
           *)
             echo "herdr-ewait: --check-source: unrecognized argument '$1'" >&2
             usage
             ;;
         esac
       done
-      cmd_check_source "$_CS_LATEST" "$_CS_EXPECT_VENDORED" "$_CS_EXPECT_REPO" "$_CS_EXPECT_PATH"
+      cmd_check_source "$_CS_LATEST" "$_CS_EXPECT_VENDORED" "$_CS_EXPECT_REPO" "$_CS_EXPECT_PATH" "$_CS_FILE"
       ;;
     --sync)
       shift
       _SYNC_ARG=""
       _SYNC_EXPECT_REPO=""
       _SYNC_EXPECT_PATH=""
-      # Same strict, order-independent parsing as --check-source (M2): the
+      # Same strict, order-independent parsing as --check-source: the
       # sha|main positional may appear before or after the --expect-* modifiers,
       # but exactly one positional and no unrecognized/extra arguments are
       # accepted.

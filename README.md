@@ -390,12 +390,12 @@ claims.
   in-progress ancestry-check scratch directory) and exit non-zero rather
   than resuming. Prints the old/new sha and a diff summary. Refuses — each
   with its own message and exit code — with no sidecar (`10`); when the
-  script path is itself a symlink, this copy's own path fails to resolve to
-  a regular readable file, on the work tree's own default branch (or an
-  undeterminable one — never guessed) or a detached HEAD, or when git is
+  script path is itself a symlink, on the work tree's own default branch (or
+  an undeterminable one — never guessed) or a detached HEAD, or when git is
   unavailable/fails to introspect the tree while an ancestor directory still
   looks like a git work tree (`11`, since the update must go through a
-  branch/worktree and a PR); or on an irregular/malformed/invalid sidecar, an
+  branch/worktree and a PR); or on an irregular/malformed/invalid sidecar,
+  this copy's own path failing to resolve to a regular readable file, an
   invalid or mismatched `--expect-repo`/`--expect-path`, a failed ancestry
   check, a failed download, or a downloaded file failing the checks above
   (`12`).
