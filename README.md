@@ -170,10 +170,10 @@ novel risk.
 
 This repo also ships `scripts/herdr-ewait.sh`, a hardened event-log consumer
 for orchestration code. It replaces hand-rolled `tail -f`/`sleep` loops with a
-cursor-based bounded reader plus live `herdr agent get` verification. It has
-a sibling copy in `edbayside/edbright-portal-core`
-(`.claude/skills/deliver-with-herdr/scripts/herdr-ewait.sh`); the two are
-kept in sync (see the script's header comment):
+cursor-based bounded reader plus live `herdr agent get` verification. This
+repo is the single source of truth for the script — see the "Vendoring"
+section below for how a copy vendored into another repo (e.g.
+`edbayside/edbright-portal-core`) stays pinned and verified against it:
 
 ```bash
 scripts/herdr-ewait.sh \
@@ -332,49 +332,68 @@ sha=<40-hex commit sha>
 
 No sidecar means this copy **is** the source; a sidecar that exists but isn't
 a regular file (a directory, a dangling symlink) is an error, not "no
-sidecar". Sidecar fields are validated strictly (attacker-controllable if the
-sidecar is edited) before ever reaching a URL. Both commands are standalone,
-herdr-free, and read none of the wait-mode flags. Before trusting any
-pinned/explicit sha, both commands confirm it is actually reachable from the
-named repo's upstream default branch (a throwaway local `git fetch` +
-`merge-base --is-ancestor`) — a sha alone proves nothing, since GitHub's
-raw-content endpoint also serves fork-network commits under the upstream path.
+sidecar", and so is a symlinked `herdr-ewait.sh` itself (both commands refuse
+it, the same rule as `--sync`'s symlink refusal). Sidecar fields are
+validated strictly (attacker-controllable if the sidecar is edited, duplicate
+or unknown keys are rejected too) before ever reaching a URL. Both commands
+are standalone, herdr-free, and read none of the wait-mode flags. Before
+trusting any pinned/explicit sha, both commands confirm it is actually
+reachable from the named repo's upstream default branch (a throwaway local
+`git fetch` + `merge-base --is-ancestor`) — a sha alone proves nothing, since
+GitHub's raw-content endpoint also serves fork-network commits under the
+upstream path. Every git call runs with all `GIT_*` env vars scrubbed,
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, and a low-speed abort
+(so a dubious-ownership/corrupt-repo/stalled-connection case fails closed
+rather than silently skipping the check or hanging); `curl` carries
+`--connect-timeout`/`--max-time` and is protocol-restricted.
 
-- `herdr-ewait.sh --check-source [--latest]` — read-only, writes nothing.
-  Fetches the pinned raw content and compares its sha256 against this
-  script's own bytes. Exit `0` for a match (or no sidecar at all), `7` for a
-  drift (both hashes printed), `8` when the fetch/hash/ancestry step itself
-  fails (fails closed, never reported as a match). `--latest` also resolves
-  the pinned repo's default-branch head and, only if the **file's content**
-  at that head actually differs (not just the commit), exits `9` with a
-  stderr notice — a commit-only move with unchanged content is exit `0`.
+- `herdr-ewait.sh --check-source [--latest] [--expect-vendored]` —
+  read-only, writes nothing. Fetches the pinned raw content and compares its
+  sha256 against this script's own bytes. Exit `0` for a match (or no
+  sidecar at all, unless `--expect-vendored` is given — see below), `7` for
+  a drift (both hashes printed), `8` when the fetch/hash/ancestry step
+  itself fails, the sidecar is irregular/malformed/invalid, or this copy is
+  a symlink (fails closed, never reported as a match). `--latest` also
+  resolves the pinned repo's default-branch head and, only if the **file's
+  content** at that head actually differs (not just the commit), exits `9`
+  with a stderr notice — a commit-only move with unchanged content is exit
+  `0`. `--expect-vendored` turns "no sidecar" from a clean exit `0` into a
+  distinct exit `13`, so a consumer's CI can assert it's looking at a
+  genuinely vendored (not accidentally source) copy.
 - `herdr-ewait.sh --sync <sha|main>` — explicit update; never commits or
   pushes. Resolves `main` to the named repo's resolved default-branch head,
   downloads the file to a temp file in the same directory, and requires it
-  to pass `bash -n` **and** look like a genuine `herdr-ewait.sh` (non-empty,
-  correct shebang, a sentinel string, and a working `--help` — `bash -n`
-  alone accepts an empty file). The new script and the rewritten sidecar are
-  both fully prepared (content + permissions matched to the originals)
-  before either atomic replace (write-temp-then-`mv`), so an already-running
-  instance keeps its old file undisturbed, and a failure between the two
-  replaces is reported as **PARTIALLY APPLIED**, not a clean refusal. Prints
-  the old/new sha and a diff summary. Refuses — each with its own message
-  and exit code — with no sidecar (`10`); when the script path is itself a
-  symlink, on the work tree's own default branch (or an undeterminable one —
-  never guessed) or a detached HEAD, or when git is unavailable while an
-  ancestor directory still looks like a git work tree (`11`, since the
-  update must go through a branch/worktree and a PR); or on an
-  irregular/invalid sidecar, a failed ancestry check, a failed download, or
-  a downloaded file failing the checks above (`12`).
+  to pass `bash -n` **and** look like a genuine `herdr-ewait.sh` — non-empty,
+  under a 1 MiB size cap, the correct shebang, a sentinel string, and a
+  trailing end-of-file sentinel line that a truncated download would be
+  missing (`bash -n` alone accepts an empty file; the downloaded file is
+  never *executed* as part of this check). The new script and the rewritten
+  sidecar are both fully prepared (content + permissions matched to the
+  originals) before either atomic replace (write-temp-then-`mv`), so an
+  already-running instance keeps its old file undisturbed, and a failure
+  between the two replaces is reported as **PARTIALLY APPLIED**, not a clean
+  refusal; Ctrl-C/SIGTERM mid-sync clean up and exit non-zero rather than
+  resuming. Prints the old/new sha and a diff summary. Refuses — each with
+  its own message and exit code — with no sidecar (`10`); when the script
+  path is itself a symlink, on the work tree's own default branch (or an
+  undeterminable one — never guessed) or a detached HEAD, or when git is
+  unavailable/fails to introspect the tree while an ancestor directory still
+  looks like a git work tree (`11`, since the update must go through a
+  branch/worktree and a PR); or on an irregular/malformed/invalid sidecar, a
+  failed ancestry check, a failed download, or a downloaded file failing the
+  checks above (`12`).
 
 Two environment variables exist **only** for tests, honoured **only** when
 `HERDR_EWAIT_TEST_HOOKS=1` is also set (every use prints a stderr WARNING),
 so they never touch the real network: `HERDR_EWAIT_RAW_BASE_URL` overrides
-the `https://raw.githubusercontent.com` base used to fetch pinned content,
-and `HERDR_EWAIT_REMOTE_BASE_URL` overrides the `https://github.com` base
-used to resolve refs via `git ls-remote`/`git fetch`. Each must be `file://`,
-an absolute local path, or `http://127.0.0.1`/`localhost` (optionally with a
-port) — any other scheme/host is refused, not silently ignored.
+the `https://raw.githubusercontent.com` base used to fetch pinned content
+(a bare absolute path is converted to a `file://` URL internally, since curl
+needs an actual URL), and `HERDR_EWAIT_REMOTE_BASE_URL` overrides the
+`https://github.com` base used to resolve refs via `git ls-remote`/`git
+fetch` (git accepts a bare absolute path natively). Each must be `file://`,
+an absolute local path, or exactly `http://127.0.0.1`/`http://localhost`
+(optionally `:<port>`, optionally a path — no userinfo/`@`) — any other
+scheme/host/authority is refused, not silently ignored.
 
 ## Development
 
