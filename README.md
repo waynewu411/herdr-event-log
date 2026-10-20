@@ -319,7 +319,7 @@ at the current log size, so it never replays old history.
 ### Vendoring: `--check-source` / `--sync`
 
 This repo is the single source of truth for `scripts/herdr-ewait.sh` — the
-script's text names no repo but this one, so a copy vendored elsewhere (e.g.
+script's text names no repo, so a copy vendored elsewhere (e.g.
 into `edbayside/edbright-portal-core`) can be byte-identical. A vendored copy
 carries a sidecar file next to it, `herdr-ewait.source`:
 
@@ -345,23 +345,36 @@ upstream path. Every git call runs with all `GIT_*` env vars scrubbed,
 `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, and a low-speed abort
 (so a dubious-ownership/corrupt-repo/stalled-connection case fails closed
 rather than silently skipping the check or hanging); `curl` carries
-`--connect-timeout`/`--max-time` and is protocol-restricted.
+`--connect-timeout`/`--max-time`/`--max-filesize` and is protocol-restricted.
+A sidecar can only vouch for itself, though — a look-alike fork could ship
+one naming itself as the upstream repo — so both commands also accept
+`--expect-repo owner/name` and `--expect-path path`, checked against the
+sidecar's own `repo=`/`path=` (strictly validated with the same format rules
+as the sidecar fields themselves); a consumer's CI should pass
+`--expect-vendored --expect-repo <owner/name> --expect-path <path>` together
+to assert it is looking at a genuinely vendored copy of the expected file
+from the expected repo, not merely trusting whatever the sidecar on disk
+claims.
 
-- `herdr-ewait.sh --check-source [--latest] [--expect-vendored]` —
+- `herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path]` —
   read-only, writes nothing. Fetches the pinned raw content and compares its
   sha256 against this script's own bytes. Exit `0` for a match (or no
   sidecar at all, unless `--expect-vendored` is given — see below), `7` for
   a drift (both hashes printed), `8` when the fetch/hash/ancestry step
-  itself fails, the sidecar is irregular/malformed/invalid, or this copy is
-  a symlink (fails closed, never reported as a match). `--latest` also
+  itself fails, the sidecar is irregular/malformed/invalid, this copy's own
+  path fails to resolve to a regular readable file, this copy is a symlink,
+  or an `--expect-repo`/`--expect-path` value is invalid or doesn't match the
+  sidecar (fails closed, never reported as a match). `--latest` also
   resolves the pinned repo's default-branch head and, only if the **file's
   content** at that head actually differs (not just the commit), exits `9`
   with a stderr notice — a commit-only move with unchanged content is exit
   `0`. `--expect-vendored` turns "no sidecar" from a clean exit `0` into a
   distinct exit `13`, so a consumer's CI can assert it's looking at a
   genuinely vendored (not accidentally source) copy.
-- `herdr-ewait.sh --sync <sha|main>` — explicit update; never commits or
-  pushes. Resolves `main` to the named repo's resolved default-branch head,
+- `herdr-ewait.sh --sync <sha|main> [--expect-repo owner/name] [--expect-path path]` —
+  explicit update; never commits or pushes. `--expect-repo`/`--expect-path`
+  are checked the same way as `--check-source`'s, before any download.
+  Resolves `main` to the named repo's resolved default-branch head,
   downloads the file to a temp file in the same directory, and requires it
   to pass `bash -n` **and** look like a genuine `herdr-ewait.sh` — non-empty,
   under a 1 MiB size cap, the correct shebang, a sentinel string, and a
@@ -371,17 +384,21 @@ rather than silently skipping the check or hanging); `curl` carries
   sidecar are both fully prepared (content + permissions matched to the
   originals) before either atomic replace (write-temp-then-`mv`), so an
   already-running instance keeps its old file undisturbed, and a failure
-  between the two replaces is reported as **PARTIALLY APPLIED**, not a clean
-  refusal; Ctrl-C/SIGTERM mid-sync clean up and exit non-zero rather than
-  resuming. Prints the old/new sha and a diff summary. Refuses — each with
-  its own message and exit code — with no sidecar (`10`); when the script
-  path is itself a symlink, on the work tree's own default branch (or an
+  between the two replaces is reported as **PARTIALLY APPLIED** (exit `14`,
+  distinct from a clean refusal — the sidecar still names the old sha), not
+  a clean refusal; Ctrl-C/SIGTERM mid-sync clean up (including any
+  in-progress ancestry-check scratch directory) and exit non-zero rather
+  than resuming. Prints the old/new sha and a diff summary. Refuses — each
+  with its own message and exit code — with no sidecar (`10`); when the
+  script path is itself a symlink, this copy's own path fails to resolve to
+  a regular readable file, on the work tree's own default branch (or an
   undeterminable one — never guessed) or a detached HEAD, or when git is
   unavailable/fails to introspect the tree while an ancestor directory still
   looks like a git work tree (`11`, since the update must go through a
-  branch/worktree and a PR); or on an irregular/malformed/invalid sidecar, a
-  failed ancestry check, a failed download, or a downloaded file failing the
-  checks above (`12`).
+  branch/worktree and a PR); or on an irregular/malformed/invalid sidecar, an
+  invalid or mismatched `--expect-repo`/`--expect-path`, a failed ancestry
+  check, a failed download, or a downloaded file failing the checks above
+  (`12`).
 
 Two environment variables exist **only** for tests, honoured **only** when
 `HERDR_EWAIT_TEST_HOOKS=1` is also set (every use prints a stderr WARNING),
