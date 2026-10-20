@@ -86,10 +86,11 @@
 #      never starts rather than watching a filter that can never match.
 #   7  --check-source: DRIFT — pinned source content hash mismatch (both hashes printed)
 #   8  --check-source: could not verify (fetch/network/hashing/ancestry-check failure,
-#      a malformed/invalid sidecar field, an irregular sidecar, this copy itself
-#      being a symlink, this copy's own path failing to resolve to a regular
-#      readable file, or an invalid or mismatched --expect-repo/--expect-path) —
-#      fails closed, never reported as a match
+#      a malformed/invalid sidecar field, an irregular sidecar, this copy's (or a
+#      --file target's) own path failing to resolve to a regular readable file,
+#      this copy (or a --file target) being a symlink, or an invalid or
+#      mismatched --expect-repo/--expect-path) — fails closed, never reported as
+#      a match
 #   9  --check-source --latest: upstream has moved past the pinned sha AND the file's
 #      own content differs (stderr notice; a commit-only move is exit 0)
 #   10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
@@ -118,9 +119,14 @@
 # --expect-repo/--expect-path to assert the sidecar names the expected repo/path
 # (a sidecar can only vouch for itself); --check-source additionally accepts --latest
 # (upstream-moved detection), --expect-vendored (assert a sidecar exists at all), and
-# --file PATH (check a GIVEN file/sidecar instead of $0, so a trusted copy can check an
-# untrusted one). Both are dispatched directly from the argument loop, before any
-# waiter setup, and a normal wait never touches the network either way.
+# --file PATH (check a GIVEN file/sidecar instead of $0). Recommended consumer-CI
+# form — runs a TRUSTED copy (taken from the consumer's own base branch, never the
+# PR branch under test, since a PR editing its own vendored copy must not be able to
+# make its own check pass) against the PR's vendored copy:
+#   bash trusted-herdr-ewait.sh --check-source --file path/to/vendored/herdr-ewait.sh \
+#     --expect-vendored --expect-repo <owner/name> --expect-path <path>
+# Both are dispatched directly from the argument loop, before any waiter setup, and
+# a normal wait never touches the network either way.
 #
 # Five hardening rules:
 #   1. check-first        4. verify-on-hit
@@ -495,13 +501,22 @@ resolve_remote_base() {
 }
 
 # "absent" (no sidecar — this copy is the source), "regular" (a real file, proceed),
-# or "irregular" (exists but isn't a regular file: a directory, a dangling symlink,
-# a device, ...) — the last one must be treated as an error, never as "no sidecar".
+# or "irregular" (a directory, a device, a dangling symlink, OR a symlink to a
+# regular file) — the last one must be treated as an error, never as "no
+# sidecar". The symlink check runs FIRST and unconditionally: `[ -f "$p" ]`
+# alone follows symlinks, so a sidecar that is itself a symlink to a genuine
+# regular file would otherwise read as "regular" — reading through a symlink
+# this script doesn't control, then (for --sync) replacing it with a REGULAR
+# file carrying the link's own mode bits (observed 0755 on macOS; GNU stat on
+# Linux would instead report the symlink's own typically-777 mode), silently
+# changing what the sidecar path points to and its permissions.
 sidecar_state() {
   local p="$1"
-  if [ -f "$p" ]; then
+  if [ -L "$p" ]; then
+    printf 'irregular'
+  elif [ -f "$p" ]; then
     printf 'regular'
-  elif [ -e "$p" ] || [ -L "$p" ]; then
+  elif [ -e "$p" ]; then
     printf 'irregular'
   else
     printf 'absent'
@@ -741,7 +756,7 @@ cmd_check_source() {
     exit 0
   fi
   if [ "$state" = "irregular" ]; then
-    echo "herdr-ewait: --check-source: '$sidecar' exists but is not a regular file (directory, dangling symlink, or similar) — treating as an error, not as 'no sidecar'" >&2
+    echo "herdr-ewait: --check-source: '$sidecar' exists but is not a regular file (a directory, a symlink, or similar) — treating as an error, not as 'no sidecar'" >&2
     exit "$EXIT_CHECK_SOURCE_FAIL"
   fi
 
@@ -931,7 +946,7 @@ cmd_sync() {
     exit "$EXIT_SYNC_NO_SIDECAR"
   fi
   if [ "$state" = "irregular" ]; then
-    echo "herdr-ewait: --sync: refused — '$sidecar' exists but is not a regular file (directory, dangling symlink, or similar)" >&2
+    echo "herdr-ewait: --sync: refused — '$sidecar' exists but is not a regular file (a directory, a symlink, or similar)" >&2
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
   fi
 
@@ -1170,8 +1185,11 @@ VENDORING (--check-source / --sync):
   edited) and never used verbatim in a URL otherwise — a duplicate or unknown key, or
   any other unparseable line, is also rejected (fail closed), not last-wins/ignored.
   No sidecar means this copy IS the source; a sidecar that exists but isn't a regular
-  file (directory, dangling symlink) is an error, not "no sidecar" — and so is this
-  script's OWN path being a symlink (both commands refuse it). Both commands are
+  file (directory, symlink, or similar — a symlinked sidecar is ALWAYS treated as
+  irregular, even one that resolves to a genuine regular file, since --sync
+  would otherwise replace it with a regular file carrying the link's own mode
+  bits) is an error, not "no sidecar" — and so is this script's OWN path being
+  a symlink (both commands refuse it). Both commands are
   standalone, read no --targets/--log/etc., and never call herdr. Before trusting ANY
   pinned/explicit sha, both commands confirm it is actually reachable from the named
   repo's upstream default branch (a throwaway local fetch + `git merge-base
@@ -1183,8 +1201,16 @@ VENDORING (--check-source / --sync):
   A sidecar can only vouch for itself — a look-alike fork could ship one naming
   itself as the upstream repo. --expect-repo/--expect-path let a caller (typically
   a consumer's own CI) assert the repo/path it actually expects, independent of
-  whatever the sidecar on disk claims; a CI check should pass
-  --expect-vendored --expect-repo <owner/name> --expect-path <path> together.
+  whatever the sidecar on disk claims.
+
+  Recommended consumer-CI form, combining --file with --expect-vendored/
+  --expect-repo/--expect-path: run a TRUSTED copy of this script (one taken
+  from the consumer's own base branch — NEVER the PR branch under test, since
+  a PR that edits its own vendored copy must not be able to make its own
+  check pass) against the PR's vendored copy:
+    bash trusted-herdr-ewait.sh --check-source \
+      --file path/to/vendored/herdr-ewait.sh \
+      --expect-vendored --expect-repo <owner/name> --expect-path <path>
 
   --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path] [--file PATH]
                               Read-only, writes nothing. No sidecar: reports "this
@@ -1284,9 +1310,10 @@ EXIT CODES:
   7  --check-source: DRIFT — the pinned source's content does not match this copy
   8  --check-source: could not verify (fetch/network/ancestry-check failure, missing
      sha256sum/shasum, a malformed/invalid sidecar field, an irregular sidecar, this
-     copy itself being a symlink, this copy's own path failing to resolve to a
-     regular readable file, or a --expect-repo/--expect-path mismatch or invalid
-     value) — fails closed, never reported as a match
+     copy's (or a --file target's) own path failing to resolve to a regular readable
+     file, this copy (or a --file target) being a symlink, or a --expect-repo/
+     --expect-path mismatch or invalid value) — fails closed, never reported as a
+     match
   9  --check-source --latest: upstream has moved past the pinned sha AND the file's
      own content differs (a commit-only move with unchanged content is exit 0)
   10 --sync: refused — no herdr-ewait.source sidecar (this copy is the source)
@@ -1349,26 +1376,39 @@ while [ $# -gt 0 ]; do
       _CS_LATEST=0
       _CS_EXPECT_VENDORED=0
       _CS_EXPECT_REPO=""
+      _CS_EXPECT_REPO_SET=0
       _CS_EXPECT_PATH=""
+      _CS_EXPECT_PATH_SET=0
       _CS_FILE=""
+      _CS_FILE_SET=0
       # Strict, order-independent modifier parsing: any unrecognized flag or
       # leftover positional argument is a usage error (exit 4) — a typo'd modifier
       # (e.g. --expect-vendroed) or a stray extra argument must never be silently
       # ignored the way a permissive "consume known flags, drop the rest" loop
-      # would.
+      # would. A value starting with '-' is refused too (never silently consumed
+      # as a value) — otherwise e.g. `--expect-path --expect-vendored` would
+      # swallow the --expect-vendored FLAG as --expect-path's VALUE, silently
+      # disabling the --expect-vendored check the caller actually asked for. A
+      # repeated modifier is refused the same way, rather than last-wins.
       while [ $# -gt 0 ]; do
         case "$1" in
           --latest) _CS_LATEST=1; shift ;;
           --expect-vendored) _CS_EXPECT_VENDORED=1; shift ;;
           --expect-repo)
+            [ "$_CS_EXPECT_REPO_SET" -eq 0 ] || { echo "herdr-ewait: --check-source --expect-repo given more than once" >&2; usage; }
             [ -n "${2:-}" ] || { echo "herdr-ewait: --check-source --expect-repo requires a value (owner/name)" >&2; usage; }
-            _CS_EXPECT_REPO="$2"; shift 2 ;;
+            case "$2" in -*) echo "herdr-ewait: --check-source --expect-repo: '$2' looks like a flag, not a value" >&2; usage ;; esac
+            _CS_EXPECT_REPO="$2"; _CS_EXPECT_REPO_SET=1; shift 2 ;;
           --expect-path)
+            [ "$_CS_EXPECT_PATH_SET" -eq 0 ] || { echo "herdr-ewait: --check-source --expect-path given more than once" >&2; usage; }
             [ -n "${2:-}" ] || { echo "herdr-ewait: --check-source --expect-path requires a value" >&2; usage; }
-            _CS_EXPECT_PATH="$2"; shift 2 ;;
+            case "$2" in -*) echo "herdr-ewait: --check-source --expect-path: '$2' looks like a flag, not a value" >&2; usage ;; esac
+            _CS_EXPECT_PATH="$2"; _CS_EXPECT_PATH_SET=1; shift 2 ;;
           --file)
+            [ "$_CS_FILE_SET" -eq 0 ] || { echo "herdr-ewait: --check-source --file given more than once" >&2; usage; }
             [ -n "${2:-}" ] || { echo "herdr-ewait: --check-source --file requires a value (a path)" >&2; usage; }
-            _CS_FILE="$2"; shift 2 ;;
+            case "$2" in -*) echo "herdr-ewait: --check-source --file: '$2' looks like a flag, not a value" >&2; usage ;; esac
+            _CS_FILE="$2"; _CS_FILE_SET=1; shift 2 ;;
           *)
             echo "herdr-ewait: --check-source: unrecognized argument '$1'" >&2
             usage
@@ -1381,19 +1421,26 @@ while [ $# -gt 0 ]; do
       shift
       _SYNC_ARG=""
       _SYNC_EXPECT_REPO=""
+      _SYNC_EXPECT_REPO_SET=0
       _SYNC_EXPECT_PATH=""
+      _SYNC_EXPECT_PATH_SET=0
       # Same strict, order-independent parsing as --check-source: the
       # sha|main positional may appear before or after the --expect-* modifiers,
       # but exactly one positional and no unrecognized/extra arguments are
-      # accepted.
+      # accepted; a value starting with '-', or a repeated modifier, is refused
+      # the same way (see --check-source's parsing above for why).
       while [ $# -gt 0 ]; do
         case "$1" in
           --expect-repo)
+            [ "$_SYNC_EXPECT_REPO_SET" -eq 0 ] || { echo "herdr-ewait: --sync --expect-repo given more than once" >&2; usage; }
             [ -n "${2:-}" ] || { echo "herdr-ewait: --sync --expect-repo requires a value (owner/name)" >&2; usage; }
-            _SYNC_EXPECT_REPO="$2"; shift 2 ;;
+            case "$2" in -*) echo "herdr-ewait: --sync --expect-repo: '$2' looks like a flag, not a value" >&2; usage ;; esac
+            _SYNC_EXPECT_REPO="$2"; _SYNC_EXPECT_REPO_SET=1; shift 2 ;;
           --expect-path)
+            [ "$_SYNC_EXPECT_PATH_SET" -eq 0 ] || { echo "herdr-ewait: --sync --expect-path given more than once" >&2; usage; }
             [ -n "${2:-}" ] || { echo "herdr-ewait: --sync --expect-path requires a value" >&2; usage; }
-            _SYNC_EXPECT_PATH="$2"; shift 2 ;;
+            case "$2" in -*) echo "herdr-ewait: --sync --expect-path: '$2' looks like a flag, not a value" >&2; usage ;; esac
+            _SYNC_EXPECT_PATH="$2"; _SYNC_EXPECT_PATH_SET=1; shift 2 ;;
           -*)
             echo "herdr-ewait: --sync: unrecognized option '$1'" >&2
             usage

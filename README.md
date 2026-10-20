@@ -331,7 +331,9 @@ sha=<40-hex commit sha>
 ```
 
 No sidecar means this copy **is** the source; a sidecar that exists but isn't
-a regular file (a directory, a dangling symlink) is an error, not "no
+a regular file (a directory, a symlink — even one resolving to a genuine
+regular file, since `--sync` would otherwise replace it with a regular file
+carrying the link's own mode bits — or similar) is an error, not "no
 sidecar", and so is a symlinked `herdr-ewait.sh` itself (both commands refuse
 it, the same rule as `--sync`'s symlink refusal). Sidecar fields are
 validated strictly (attacker-controllable if the sidecar is edited, duplicate
@@ -350,20 +352,39 @@ A sidecar can only vouch for itself, though — a look-alike fork could ship
 one naming itself as the upstream repo — so both commands also accept
 `--expect-repo owner/name` and `--expect-path path`, checked against the
 sidecar's own `repo=`/`path=` (strictly validated with the same format rules
-as the sidecar fields themselves); a consumer's CI should pass
-`--expect-vendored --expect-repo <owner/name> --expect-path <path>` together
-to assert it is looking at a genuinely vendored copy of the expected file
-from the expected repo, not merely trusting whatever the sidecar on disk
-claims.
+as the sidecar fields themselves).
 
-- `herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path]` —
+Running `herdr-ewait.sh --check-source` against its OWN `$0` still has a gap
+for a CI check specifically: a pull request that edits the vendored copy can
+make the check that verifies it pass, because the check and the file it is
+checking are the same (possibly-edited) script. `--check-source` alone
+additionally accepts `--file PATH`, which checks the GIVEN file (and reads
+its sidecar from the same directory) instead of `$0`, under the same strict
+rules (`PATH` must resolve to a regular, readable, non-symlink file). The
+recommended consumer CI form runs a **trusted** copy of this script — one
+taken from the consumer's own base branch, never the PR branch being
+checked — against the PR's vendored copy:
+
+```bash
+bash trusted-herdr-ewait.sh --check-source --file path/to/vendored/herdr-ewait.sh \
+  --expect-vendored --expect-repo waynewu411/herdr-event-log --expect-path scripts/herdr-ewait.sh
+```
+
+`--expect-vendored`/`--expect-repo`/`--expect-path` assert it is looking at a
+genuinely vendored copy of the expected file from the expected repo, not
+merely trusting whatever the sidecar on disk (also part of the PR, and so
+also attacker-controllable) claims.
+
+- `herdr-ewait.sh --check-source [--latest] [--expect-vendored] [--expect-repo owner/name] [--expect-path path] [--file PATH]` —
   read-only, writes nothing. Fetches the pinned raw content and compares its
-  sha256 against this script's own bytes. Exit `0` for a match (or no
+  sha256 against this script's own bytes (or, with `--file PATH`, PATH's
+  bytes and PATH's own sidecar — see above). Exit `0` for a match (or no
   sidecar at all, unless `--expect-vendored` is given — see below), `7` for
   a drift (both hashes printed), `8` when the fetch/hash/ancestry step
-  itself fails, the sidecar is irregular/malformed/invalid, this copy's own
-  path fails to resolve to a regular readable file, this copy is a symlink,
-  or an `--expect-repo`/`--expect-path` value is invalid or doesn't match the
+  itself fails, the sidecar is irregular/malformed/invalid, this copy's (or
+  the `--file` target's) own path fails to resolve to a regular readable
+  file, this copy (or the `--file` target) is a symlink, or an
+  `--expect-repo`/`--expect-path` value is invalid or doesn't match the
   sidecar (fails closed, never reported as a match). `--latest` also
   resolves the pinned repo's default-branch head and, only if the **file's
   content** at that head actually differs (not just the commit), exits `9`
