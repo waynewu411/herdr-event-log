@@ -673,13 +673,28 @@ resolve_remote_ref() {
 # must fail CLOSED on that (refuse), never guess a common name like "main"/"master".
 default_branch_of() {
   local dir="$1" ref
-  ref="$(git_safe -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-  if [ -n "$ref" ]; then
-    printf '%s' "${ref#origin/}"
-    return 0
-  fi
-  ref="$(git_safe -C "$dir" ls-remote --symref origin HEAD 2>/dev/null | awk '$1 == "ref:" {print $2}' | sed 's#^refs/heads/##')"
-  [ -n "$ref" ] && { printf '%s' "$ref"; return 0; }
+  # Full ref form (`-q`, no `--short`): `--short` abbreviates to the SHORTEST
+  # UNAMBIGUOUS name, which depends on what other refs happen to exist — a
+  # local branch literally named "origin/main" makes refs/remotes/origin/HEAD
+  # (which points at refs/remotes/origin/main) shorten to "remotes/origin/main"
+  # instead of "origin/main", silently breaking the "${ref#origin/}" strip
+  # below and letting --sync run on the real default branch undetected.
+  # Parsing the full, unambiguous ref and requiring the exact expected prefix
+  # closes that gap regardless of what else is in the repo.
+  ref="$(git_safe -C "$dir" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)"
+  case "$ref" in
+    refs/remotes/origin/?*)
+      printf '%s' "${ref#refs/remotes/origin/}"
+      return 0
+      ;;
+  esac
+  ref="$(git_safe -C "$dir" ls-remote --symref origin HEAD 2>/dev/null | awk '$1 == "ref:" {print $2}')"
+  case "$ref" in
+    refs/heads/?*)
+      printf '%s' "${ref#refs/heads/}"
+      return 0
+      ;;
+  esac
   return 1
 }
 
@@ -704,10 +719,17 @@ verify_sha_on_upstream() {
   url="$base/$repo"
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ewait.verify-ancestry.XXXXXX" 2>/dev/null)" || return 1
   _register_cleanup "$scratch"
+  # --git-dir="$scratch", not `-C "$scratch"`: with the user's
+  # safe.bareRepository=explicit (a real gitconfig setting), `-C` on a bare
+  # repo fails with "cannot use bare repository" because `-C` only changes
+  # directory and lets git DISCOVER the repo there, which that setting
+  # refuses for anything but an EXPLICITLY named git dir — exactly what
+  # --git-dir provides. `git init --bare` itself is unaffected (creating the
+  # directory, not discovering an existing repo in it).
   if git_safe init -q --bare "$scratch" >/dev/null 2>&1 \
-    && { git_safe -C "$scratch" fetch -q --no-tags --filter=tree:0 -- "$url" HEAD >/dev/null 2>&1 \
-         || git_safe -C "$scratch" fetch -q --no-tags -- "$url" HEAD >/dev/null 2>&1; } \
-    && git_safe -C "$scratch" merge-base --is-ancestor "$sha" FETCH_HEAD 2>/dev/null; then
+    && { git_safe --git-dir="$scratch" fetch -q --no-tags --filter=tree:0 -- "$url" HEAD >/dev/null 2>&1 \
+         || git_safe --git-dir="$scratch" fetch -q --no-tags -- "$url" HEAD >/dev/null 2>&1; } \
+    && git_safe --git-dir="$scratch" merge-base --is-ancestor "$sha" FETCH_HEAD 2>/dev/null; then
     ok=0
   fi
   rm -rf "$scratch"
@@ -976,7 +998,17 @@ cmd_sync() {
     done
   else
     local current default_branch
-    current="$(git_safe -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
+    # Full ref form here too (see default_branch_of's comment on --short's
+    # ambiguity-dependent output): a TAG literally named "main" makes plain
+    # `symbolic-ref --short HEAD` shorten refs/heads/main to "heads/main"
+    # instead of "main" to disambiguate it from refs/tags/main, which would
+    # never equal default_branch_of's "main" and silently let --sync run on
+    # the real default branch.
+    current="$(git_safe -C "$dir" symbolic-ref -q HEAD 2>/dev/null || true)"
+    case "$current" in
+      refs/heads/?*) current="${current#refs/heads/}" ;;
+      *) current="" ;;
+    esac
     if [ -z "$current" ]; then
       echo "herdr-ewait: --sync: refused — $dir is a git work tree with a detached HEAD; check out a branch (or use a worktree) before syncing" >&2
       exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
