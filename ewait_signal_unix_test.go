@@ -16,6 +16,64 @@ import (
 	"time"
 )
 
+// TestWaitMode_SIGTERM_StopsQuickly_NotDeferredByPoll:
+// installing the vendoring INT/TERM traps unconditionally at script scope
+// regressed ordinary wait-mode runs — a trap is only ever acted on BETWEEN
+// foreground commands, so with one installed, SIGTERM is deferred until the
+// current `sleep "$POLL"`/`herdr agent get` call finishes (measured: up to a
+// full --poll interval, here 60s, instead of immediately). Wait mode must now
+// install no trap at all and behave exactly as before vendoring was added:
+// SIGTERM kills bash itself within a couple of seconds, not up to --poll.
+//
+// This deliberately signals ONLY bash's own pid (not the whole process group
+// via -pid, the way the --sync signal tests do): that matches how a real
+// supervisor/process manager tracking a single child pid delivers SIGTERM,
+// and is exactly the scenario that exposed the regression — if the blocking
+// `sleep "$POLL"` child were ALSO signaled (a process-group-wide kill), it
+// would die immediately and mask the deferred-trap bug entirely.
+//
+// Liveness is checked by polling kill(pid, 0) directly, NOT by waiting on
+// proc.wait()/cmd.Wait(): cmd.Wait() also blocks until the Stdout/Stderr
+// io-copy goroutines see EOF, and since bash's own SIGTERM (sent to only its
+// pid) leaves the still-running `sleep "$POLL"` child alive as an orphan that
+// inherited the SAME stdout/stderr pipe, that orphan keeps the pipe open —
+// and cmd.Wait() blocked — for the rest of its sleep, regardless of how
+// quickly bash itself actually died (the same caveat killProcessGroup's own
+// doc comment describes for exactly this reason). kill(pid, 0) only asks
+// "does this specific pid still exist", independent of any lingering
+// child/pipe, so it isolates bash's own death precisely.
+func TestWaitMode_SIGTERM_StopsQuickly_NotDeferredByPoll(t *testing.T) {
+	logPath, cursorPath := newEwaitFiles(t)
+
+	proc := startEwait(t, []string{
+		"--targets", "w9:p1",
+		"--log", logPath,
+		"--cursor-file", cursorPath,
+		"--overall-timeout", "3600",
+		"--poll", "60",
+		"--safety-net", "60",
+	}, stubConfig{alwaysWorking: "w9:p1"})
+	defer killProcessGroup(proc.cmd) // reap the orphaned `sleep 60` either way
+
+	time.Sleep(700 * time.Millisecond) // let it get into its poll loop first
+
+	pid := proc.cmd.Process.Pid
+	if err := proc.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second) // well under --poll's 60s; the bug made this take ~60s
+	for {
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return // bash itself is gone — success
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bash (pid %d) still alive 3s after SIGTERM — a trap is deferring it until the current poll/herdr-call finishes", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestSync_SIGINT_CleansUpAndExitsNonZero(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := copyScriptToDir(t, dir)
@@ -74,7 +132,7 @@ func hasTempScriptFile(t *testing.T, dir string) bool {
 	return false
 }
 
-// TestSync_SIGTERM_CleansUpAndExitsNonZero (L6): SIGTERM must stop a sync in
+// TestSync_SIGTERM_CleansUpAndExitsNonZero: SIGTERM must stop a sync in
 // progress exactly like SIGINT does (128+signal, cleanup), and — since this
 // signal lands during the fetch step, before either atomic mv — the original
 // script file must be left completely untouched, not just "no leftover temp
@@ -128,7 +186,7 @@ func TestSync_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
 	}
 }
 
-// TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir (L4): the ancestry
+// TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir: the ancestry
 // scratch dir created by verify_sha_on_upstream must be registered for cleanup
 // too, not just check-source's/sync's own temp files — a SIGTERM delivered
 // while `git fetch` is still running inside the ancestry check must not leak
