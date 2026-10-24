@@ -162,11 +162,6 @@ func setupFakeRemote(t *testing.T, repo string) (remoteBase, firstSHA, secondSHA
 }
 
 // initGitRepoWithDefaultBranch makes dir a git work tree on "main" with one
-// commit, and records refs/remotes/origin/HEAD locally (a pure local ref
-// write — no real 'origin' remote is needed) so default_branch_of() can
-// resolve the default branch name without any network access, exactly as a
-// real clone or `git remote set-head origin -a` would leave it.
-// initGitRepoWithDefaultBranch makes dir a git work tree on "main" with one
 // commit, and records refs/remotes/origin/HEAD as a REAL remote-tracking ref
 // would be (pointing at refs/remotes/origin/main, itself a real ref —
 // exactly what `git clone`/`git remote set-head origin -a` leaves behind),
@@ -184,6 +179,61 @@ func initGitRepoWithDefaultBranch(t *testing.T, dir string) {
 	headSHA := strings.TrimSpace(gitCmd(t, dir, "rev-parse", "HEAD"))
 	gitCmd(t, dir, "update-ref", "refs/remotes/origin/main", headSHA)
 	gitCmd(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+}
+
+// dropLocalOriginHeadRef removes the locally-recorded refs/remotes/origin/HEAD
+// (and the refs/remotes/origin/main it points at) that initGitRepoWithDefaultBranch
+// set up, forcing default_branch_of to fall through to its second resolution
+// path — a read-only `git ls-remote --symref origin HEAD` against a real
+// configured 'origin' remote — exactly as it would on a fresh work tree that
+// never ran `git remote set-head origin -a`.
+func dropLocalOriginHeadRef(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(dir, ".git", "refs", "remotes", "origin", "HEAD")); err != nil {
+		t.Fatalf("remove refs/remotes/origin/HEAD: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, ".git", "refs", "remotes", "origin", "main")); err != nil {
+		t.Fatalf("remove refs/remotes/origin/main: %v", err)
+	}
+}
+
+// setupLocalBareOrigin creates a local bare git repo (one commit on "main",
+// HEAD pointing there) and returns its filesystem path — a fully offline
+// stand-in for a real 'origin' remote, suitable for `git remote add origin
+// <path>`, used to exercise default_branch_of's `ls-remote --symref origin
+// HEAD` fallback without any network access.
+func setupLocalBareOrigin(t *testing.T) string {
+	t.Helper()
+	work := t.TempDir()
+	gitCmd(t, work, "init", "-q", "-b", "main")
+	gitCmd(t, work, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init", "--allow-empty")
+	bareParent := t.TempDir()
+	bareDir := filepath.Join(bareParent, "origin.git")
+	gitCmd(t, bareParent, "clone", "-q", "--bare", work, bareDir)
+	return bareDir
+}
+
+// filesystemIsCaseSensitive reports whether t.TempDir()'s filesystem treats
+// "case-probe" and "CASE-PROBE" as distinct directory entries. On a
+// case-insensitive filesystem (e.g. macOS's default APFS), writing the
+// second overwrites the first, so reading the first back afterward returns
+// the second write's content instead of its own.
+func filesystemIsCaseSensitive(t *testing.T) bool {
+	t.Helper()
+	dir := t.TempDir()
+	lower := filepath.Join(dir, "case-probe")
+	upper := filepath.Join(dir, "CASE-PROBE")
+	if err := os.WriteFile(lower, []byte("lower"), 0o644); err != nil {
+		t.Fatalf("case-sensitivity probe: write lower: %v", err)
+	}
+	if err := os.WriteFile(upper, []byte("upper"), 0o644); err != nil {
+		t.Fatalf("case-sensitivity probe: write upper: %v", err)
+	}
+	got, err := os.ReadFile(lower)
+	if err != nil {
+		t.Fatalf("case-sensitivity probe: read lower back: %v", err)
+	}
+	return string(got) == "lower"
 }
 
 func writeExec(t *testing.T, path, content string) {
@@ -685,6 +735,62 @@ func TestCheckSource_Match_WithSafeBareRepositoryExplicit(t *testing.T) {
 
 	if res.exitCode != 0 {
 		t.Fatalf("exit = %d, want 0 (safe.bareRepository=explicit must not break the ancestry check's bare scratch repo); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if !strings.Contains(strings.ToLower(res.stdout), "match") {
+		t.Errorf("stdout should report a match; got %q", res.stdout)
+	}
+}
+
+// TestCheckSource_Match_FromDeletedCwd: `--git-dir="$scratch"` alone still
+// leaves the process cwd as whatever the caller's was, and git's own setup
+// calls getcwd() early regardless of --git-dir — if that cwd has since been
+// removed (not unusual for a long-running orchestration process that cleans
+// up its own working directory), the call fails with "Unable to read
+// current working directory" even though it never needed the cwd for
+// anything, causing a false refusal (exit 8). The fix also passes
+// -C "$scratch" (a directory that, unlike the caller's cwd, is guaranteed
+// to exist) alongside --git-dir. Removes the cwd right after starting the
+// process — deterministic, not a race, since nothing in --check-source's
+// match path ever chdirs elsewhere afterward.
+func TestCheckSource_Match_FromDeletedCwd(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	rawBase := t.TempDir()
+	writeRawFixture(t, rawBase, fakeRepo, headSHA, fakeScriptRelPath, scriptBytes)
+
+	requireEwaitTools(t)
+	deletedCwd := t.TempDir()
+	cmd := exec.Command("bash", append([]string{scriptPath}, "--check-source")...)
+	cmd.Dir = deletedCwd
+	cmd.Env = testHookEnv(t,
+		"HERDR_EWAIT_RAW_BASE_URL="+rawBaseURL(rawBase),
+		"HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase,
+	)
+	setNewProcessGroup(cmd)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start herdr-ewait.sh: %v", err)
+	}
+	if err := os.RemoveAll(deletedCwd); err != nil {
+		t.Fatalf("remove the running process's cwd: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	proc := &ewaitProcess{cmd: cmd, stdout: &stdout, stderr: &stderr, done: done}
+	res := proc.wait(t, 10*time.Second)
+
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (match from a deleted cwd); stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
 	}
 	if !strings.Contains(strings.ToLower(res.stdout), "match") {
 		t.Errorf("stdout should report a match; got %q", res.stdout)
@@ -1847,6 +1953,9 @@ func TestSync_Refuse_OnDefaultBranch(t *testing.T) {
 	if res.exitCode != exitSyncOnDefaultBranch {
 		t.Fatalf("exit = %d, want %d; stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
 	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
 	after, _ := os.ReadFile(scriptPath)
 	if string(before) != string(after) {
 		t.Errorf("script file must not be touched on refusal")
@@ -1882,6 +1991,9 @@ func TestSync_Refuse_OnDefaultBranch_WithLocalBranchNamedOriginMain(t *testing.T
 	if res.exitCode != exitSyncOnDefaultBranch {
 		t.Fatalf("exit = %d, want %d (a local branch named origin/main must not let --sync bypass the default-branch refusal); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
 	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
 	after, _ := os.ReadFile(scriptPath)
 	if string(before) != string(after) {
 		t.Errorf("script file must not be touched on refusal")
@@ -1903,6 +2015,145 @@ func TestSync_Refuse_OnDefaultBranch_WithTagNamedMain(t *testing.T) {
 
 	if res.exitCode != exitSyncOnDefaultBranch {
 		t.Fatalf("exit = %d, want %d (a tag named main must not let --sync bypass the default-branch refusal); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
+// TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback and its
+// _WithAmbiguousRefs variant cover default_branch_of's SECOND resolution
+// path — `git ls-remote --symref origin HEAD` against a real 'origin'
+// remote — which the --short-ambiguity tests above never exercise (they all
+// go through the first path, refs/remotes/origin/HEAD recorded locally).
+// Mutating this fallback's `case "$ref" in refs/heads/?*)` guard to print
+// the unstripped "refs/heads/main" (instead of stripping the prefix) made
+// the whole suite pass regardless, because nothing else drove this code
+// path at all.
+func TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir) // creates+checks out "main", current HEAD
+	dropLocalOriginHeadRef(t, dir)
+	bareOrigin := setupLocalBareOrigin(t)
+	gitCmd(t, dir, "remote", "add", "origin", bareOrigin)
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (ls-remote --symref fallback must still refuse on the default branch); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
+// TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback_WithAmbiguousRefs
+// adds a tag named "main" AND a local branch named "origin/main" on top of
+// the fallback setup above — both of which make `--short` forms ambiguous
+// (see the WithLocalBranchNamedOriginMain/WithTagNamedMain tests) — to
+// confirm the ls-remote --symref fallback's full-ref parsing isn't itself
+// vulnerable to the same kind of ambiguity the --short-based code was.
+func TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback_WithAmbiguousRefs(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir) // creates+checks out "main", current HEAD
+	dropLocalOriginHeadRef(t, dir)
+	bareOrigin := setupLocalBareOrigin(t)
+	gitCmd(t, dir, "remote", "add", "origin", bareOrigin)
+	// Create the branch BEFORE the tag: once a branch and a tag share the
+	// same name, "main" is ambiguous for every later git command that
+	// resolves it for any reason (not just --short abbreviation — plain
+	// `git branch <newname>` with no explicit start-point fails outright
+	// once that ambiguity exists), so the branch must exist first.
+	gitCmd(t, dir, "branch", "origin/main")
+	gitCmd(t, dir, "tag", "main")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (ambiguous refs must not defeat the ls-remote --symref fallback either); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
+// TestSync_Success_OnFeatureBranch_ViaLsRemoteSymrefFallback is the control:
+// the same ls-remote --symref fallback setup, but on a feature branch, which
+// must proceed PAST the default-branch refusal (it still fails later, at the
+// ancestry check, because deadHookEnv's test hooks point nowhere — that
+// failure, exitSyncBadDownload rather than exitSyncOnDefaultBranch, is what
+// proves the refusal check itself let it through).
+func TestSync_Success_OnFeatureBranch_ViaLsRemoteSymrefFallback(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir)
+	dropLocalOriginHeadRef(t, dir)
+	bareOrigin := setupLocalBareOrigin(t)
+	gitCmd(t, dir, "remote", "add", "origin", bareOrigin)
+	gitCmd(t, dir, "checkout", "-q", "-b", "feature/sync-test")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode == exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d (on-default-branch refusal), want anything else — a feature branch must pass the refusal check; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+}
+
+// TestSync_Refuse_OnDefaultBranch_CaseInsensitiveCheckout covers the
+// case-insensitive-filesystem gap: on APFS (macOS's default), `git checkout
+// Main` resolves to the SAME loose ref file as an existing "main" branch,
+// but leaves HEAD symbolically pointing at the literal string
+// "refs/heads/Main" — textually different from default_branch_of's "main".
+// An exact-string comparison would treat that as a different, non-default
+// branch and wrongly let --sync proceed on what is, on that filesystem,
+// genuinely the repo's protected default branch. The fix folds case on both
+// sides of the comparison unconditionally (see cmd_sync's comment) rather
+// than only on a detected case-insensitive filesystem — the simplest choice
+// that is safe everywhere, documented there as an intentional, slightly
+// more conservative refusal on any repo with two case-differing branch
+// names on a case-sensitive filesystem too.
+func TestSync_Refuse_OnDefaultBranch_CaseInsensitiveCheckout(t *testing.T) {
+	if filesystemIsCaseSensitive(t) {
+		t.Skip("filesystem is case-sensitive; 'git checkout Main' would need an actual distinct 'Main' branch to reproduce this, not the same-file collision this test targets")
+	}
+
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir) // creates+checks out "main"
+	gitCmd(t, dir, "checkout", "-q", "Main")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (checking out 'Main' on a case-insensitive filesystem must still refuse as the default branch); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
 	}
 	after, _ := os.ReadFile(scriptPath)
 	if string(before) != string(after) {
