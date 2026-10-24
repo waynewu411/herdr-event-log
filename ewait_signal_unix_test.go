@@ -81,9 +81,17 @@ func TestSync_SIGINT_CleansUpAndExitsNonZero(t *testing.T) {
 	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
 
 	// A curl stub that blocks long enough for the test to deliver SIGINT while
-	// cmd_sync is inside the fetch step, after its cleanup trap is armed.
+	// cmd_sync is inside the fetch step, after its cleanup trap is armed. The
+	// marker, written immediately before the stub's own sleep, lets the test
+	// wait (bounded) for the fetch step to actually be running instead of
+	// relying on a fixed wall-clock delay — a fixed delay either wastes time
+	// when the machine is fast or, under load, fires before the ancestry
+	// check (a real `git fetch` against the local fake remote) and the
+	// tmp_script mktemp have actually completed, which previously failed
+	// this test outright at the hasTempScriptFile check below.
 	stubDir := t.TempDir()
-	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\nsleep 30\n")
+	fetchStartedMarker := filepath.Join(stubDir, "fetch-started")
+	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\n: > '"+fetchStartedMarker+"'\nsleep 30\n")
 
 	env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
 	for i, kv := range env {
@@ -93,7 +101,20 @@ func TestSync_SIGINT_CleansUpAndExitsNonZero(t *testing.T) {
 	}
 
 	proc := startEwaitAt(t, scriptPath, []string{"--sync", headSHA}, env)
-	time.Sleep(700 * time.Millisecond) // let it reach the (trap-armed) fetch step
+
+	markerDeadline := time.Now().Add(5 * time.Second)
+	var sawFetchStarted bool
+	for time.Now().Before(markerDeadline) {
+		if _, err := os.Stat(fetchStartedMarker); err == nil {
+			sawFetchStarted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawFetchStarted {
+		proc.wait(t, 2*time.Second)
+		t.Fatalf("fetch-started marker never appeared at %s", fetchStartedMarker)
+	}
 
 	if !hasTempScriptFile(t, dir) {
 		t.Fatalf("expected a .herdr-ewait.sh.tmp.* file to exist before SIGINT (trap not yet armed?)")
@@ -219,8 +240,14 @@ func TestCheckSource_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
 	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
 	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
 
+	// Marker written immediately before the stub's own sleep, so the test
+	// can wait (bounded) for the fetch step to actually be running instead
+	// of relying on a fixed wall-clock delay — see
+	// TestSync_SIGTERM_CleansUpAndExitsNonZero's comment for why a fixed
+	// delay is unreliable under load.
 	stubDir := t.TempDir()
-	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\nsleep 30\n")
+	fetchStartedMarker := filepath.Join(stubDir, "fetch-started")
+	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\n: > '"+fetchStartedMarker+"'\nsleep 30\n")
 
 	tmpDir := t.TempDir()
 	env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
@@ -234,7 +261,20 @@ func TestCheckSource_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
 	}
 
 	proc := startEwaitAt(t, scriptPath, []string{"--check-source"}, env)
-	time.Sleep(700 * time.Millisecond) // let it reach the (trap-armed) fetch step
+
+	markerDeadline := time.Now().Add(5 * time.Second)
+	var sawFetchStarted bool
+	for time.Now().Before(markerDeadline) {
+		if _, err := os.Stat(fetchStartedMarker); err == nil {
+			sawFetchStarted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawFetchStarted {
+		proc.wait(t, 2*time.Second)
+		t.Fatalf("fetch-started marker never appeared at %s", fetchStartedMarker)
+	}
 
 	if !hasCheckSourceTempFile(t, tmpDir) {
 		t.Fatalf("expected a herdr-ewait.check-source.* temp file to exist before SIGTERM (trap not yet armed?)")
