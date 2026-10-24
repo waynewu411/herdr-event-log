@@ -144,7 +144,15 @@ func TestSync_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
 	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
 
 	stubDir := t.TempDir()
-	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\nsleep 30\n")
+	// Marker written immediately before the stub's own sleep, so the test can
+	// wait (bounded) for the fetch step to actually be running instead of
+	// relying on a fixed wall-clock delay — a fixed delay either wastes time
+	// when the machine is fast or, under load, fires before the ancestry
+	// check (a real `git fetch` against the local fake remote) and the
+	// tmp_script mktemp have actually completed, which previously failed
+	// this test outright at the hasTempScriptFile check below.
+	fetchStartedMarker := filepath.Join(stubDir, "fetch-started")
+	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\n: > '"+fetchStartedMarker+"'\nsleep 30\n")
 
 	env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
 	for i, kv := range env {
@@ -159,7 +167,20 @@ func TestSync_SIGTERM_CleansUpAndExitsNonZero(t *testing.T) {
 	}
 
 	proc := startEwaitAt(t, scriptPath, []string{"--sync", headSHA}, env)
-	time.Sleep(700 * time.Millisecond) // let it reach the (trap-armed) fetch step
+
+	markerDeadline := time.Now().Add(5 * time.Second)
+	var sawFetchStarted bool
+	for time.Now().Before(markerDeadline) {
+		if _, err := os.Stat(fetchStartedMarker); err == nil {
+			sawFetchStarted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawFetchStarted {
+		proc.wait(t, 2*time.Second)
+		t.Fatalf("fetch-started marker never appeared at %s", fetchStartedMarker)
+	}
 
 	if !hasTempScriptFile(t, dir) {
 		t.Fatalf("expected a .herdr-ewait.sh.tmp.* file to exist before SIGTERM (trap not yet armed?)")
@@ -338,19 +359,27 @@ func TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir(t *testing.T) {
 	}
 }
 
-// TestSync_SIGTERM_Stress_NoLeftoverTempFiles sends SIGTERM at a spread of
-// small delays from process start — some land before the ancestry check's
-// scratch dir even exists, some while "init" is the foreground command,
-// some mid-sleep during the stubbed "fetch" — covering the mktemp-to-
-// _register_cleanup gap this round's fix targets (every mktemp template now
-// embeds $$, and _cleanup_all's glob sweep catches anything the exact-path
-// registry missed) without needing to land the signal in that specific,
-// microseconds-wide window exactly: a leftover temp file/dir under either
-// TMPDIR or the sync directory after ANY trial is a failure, regardless of
-// which point in the flow the signal happened to interrupt. Bounded
-// runtime: every trial's fake git stub sleeps during "fetch" far longer
-// than any delay tried here, so --sync never reaches the install phase
-// (and so never mutates the real script/sidecar) in any trial.
+// TestSync_SIGTERM_Stress_NoLeftoverTempFiles is a general robustness SMOKE
+// TEST, not a deterministic test of the mktemp-to-_register_cleanup gap: it
+// sends SIGTERM at a spread of small (millisecond-scale) delays from
+// process start, which lands somewhere during the default-branch checks,
+// "init", or mid-sleep during the stubbed "fetch" — all comfortably outside
+// the actual gap, which is two adjacent bash statements wide (nanoseconds,
+// not milliseconds). It does NOT reliably land inside that gap and does
+// NOT, on its own, prove the glob-sweep backstop or the $$-scoped mktemp
+// templates are doing anything — deleting either (verified: removing
+// _cleanup_all's $$ glob-sweep block, or removing $$ from every mktemp
+// template) still leaves this test green, because it was never exercising
+// that specific race to begin with.
+// See TestSync_SIGTERM_DuringScratchDirCreation_LeavesNoLeftovers and
+// TestSync_SIGTERM_DuringTmpScriptCreation_LeavesNoLeftovers below for
+// deterministic coverage of the actual gap, via a stubbed `mktemp` that
+// holds the race window open long enough to signal into reliably. This
+// test still has standalone value as a broad, unstructured sanity check
+// across the whole flow (bounded runtime: every trial's fake git stub
+// sleeps during "fetch" far longer than any delay tried here, so --sync
+// never reaches the install phase, and so never mutates the real
+// script/sidecar, in any trial).
 func TestSync_SIGTERM_Stress_NoLeftoverTempFiles(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := copyScriptToDir(t, dir)
@@ -407,6 +436,155 @@ func TestSync_SIGTERM_Stress_NoLeftoverTempFiles(t *testing.T) {
 			assertNoLeftoverVendoringTempFiles(t, tmpDir, dir)
 		})
 	}
+}
+
+// TestSync_SIGTERM_DuringScratchDirCreation_LeavesNoLeftovers deterministically
+// reproduces the mktemp-to-_register_cleanup gap by stubbing `mktemp` itself
+// (not a downstream git/curl call): the stub runs the REAL mktemp — so the
+// scratch directory is genuinely created on disk, exactly as it would be
+// for real — then writes a marker and sleeps. Because `scratch="$(mktemp
+// -d ...)"` is a command substitution, that assignment (and therefore the
+// following `_register_cleanup "$scratch"` line) cannot complete until the
+// stub itself exits — so for as long as the stub sleeps, the real,
+// on-disk scratch directory is guaranteed to be completely unregistered.
+// This holds the actual race window open for seconds instead of the two
+// adjacent bash statements (nanoseconds) it normally spans, so the test
+// can land a signal inside it reliably via a bounded marker-wait, rather
+// than hoping an externally-timed SIGTERM happens to land there (which
+// TestSync_SIGTERM_Stress_NoLeftoverTempFiles above does not reliably do).
+// No git repo is created at dir, so --sync's default-branch check is
+// skipped entirely (no .git found walking up from dir) and the flow goes
+// straight to verify_sha_on_upstream.
+func TestSync_SIGTERM_DuringScratchDirCreation_LeavesNoLeftovers(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	realMktemp, err := exec.LookPath("mktemp")
+	if err != nil {
+		t.Skip("mktemp not found in PATH")
+	}
+	stubDir := t.TempDir()
+	marker := filepath.Join(stubDir, "mktemp-called")
+	// Only the scratch-dir (verify-ancestry) template is slowed; anything
+	// else passes through with its real output and no delay.
+	script := "#!/usr/bin/env bash\n" +
+		"out=\"$('" + realMktemp + "' \"$@\")\"\n" +
+		"case \"$*\" in\n" +
+		"  *herdr-ewait.verify-ancestry*)\n" +
+		"    : > '" + marker + "'\n" +
+		"    sleep 30\n" +
+		"    ;;\n" +
+		"esac\n" +
+		"printf '%s\\n' \"$out\"\n"
+	writeExec(t, filepath.Join(stubDir, "mktemp"), script)
+
+	tmpDir := t.TempDir()
+	env := deadHookEnv(t)
+	for i, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "PATH="):
+			env[i] = "PATH=" + stubDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+		case strings.HasPrefix(kv, "TMPDIR="):
+			env[i] = "TMPDIR=" + tmpDir
+		}
+	}
+
+	proc := startEwaitAt(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, env)
+
+	markerDeadline := time.Now().Add(5 * time.Second)
+	var sawMarker bool
+	for time.Now().Before(markerDeadline) {
+		if _, err := os.Stat(marker); err == nil {
+			sawMarker = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawMarker {
+		proc.wait(t, 2*time.Second)
+		t.Fatalf("mktemp stub's marker never appeared at %s", marker)
+	}
+
+	if err := syscall.Kill(-proc.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM to process group: %v", err)
+	}
+
+	res := proc.wait(t, 10*time.Second)
+	if res.exitCode != 143 {
+		t.Fatalf("exit = %d, want 143 (128+SIGTERM) after cleanup; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	assertNoLeftoverVendoringTempFiles(t, tmpDir, dir)
+}
+
+// TestSync_SIGTERM_DuringTmpScriptCreation_LeavesNoLeftovers is the same
+// deterministic technique as the test above, applied to the OTHER
+// mktemp-to-_register_cleanup gap this round's fix covers: tmp_script, in
+// the sync target directory. Here the ancestry check runs for real (a
+// genuine `git fetch`/`merge-base` against setupFakeRemote's local bare
+// repo, which completes quickly and is not itself stubbed), so the flow
+// reaches cmd_sync's `tmp_script="$(mktemp ...)"` line before the signal —
+// exercising the $$-scoped glob sweep's OTHER branch (_CLEANUP_DIR, not
+// TMPDIR).
+func TestSync_SIGTERM_DuringTmpScriptCreation_LeavesNoLeftovers(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+	realMktemp, err := exec.LookPath("mktemp")
+	if err != nil {
+		t.Skip("mktemp not found in PATH")
+	}
+	stubDir := t.TempDir()
+	marker := filepath.Join(stubDir, "mktemp-called")
+	script := "#!/usr/bin/env bash\n" +
+		"out=\"$('" + realMktemp + "' \"$@\")\"\n" +
+		"case \"$*\" in\n" +
+		"  *.herdr-ewait.sh.tmp.*)\n" +
+		"    : > '" + marker + "'\n" +
+		"    sleep 30\n" +
+		"    ;;\n" +
+		"esac\n" +
+		"printf '%s\\n' \"$out\"\n"
+	writeExec(t, filepath.Join(stubDir, "mktemp"), script)
+
+	env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
+	var tmpDirUsed string
+	for i, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "PATH="):
+			env[i] = "PATH=" + stubDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+		case strings.HasPrefix(kv, "TMPDIR="):
+			tmpDirUsed = strings.TrimPrefix(kv, "TMPDIR=")
+		}
+	}
+
+	proc := startEwaitAt(t, scriptPath, []string{"--sync", headSHA}, env)
+
+	markerDeadline := time.Now().Add(5 * time.Second)
+	var sawMarker bool
+	for time.Now().Before(markerDeadline) {
+		if _, err := os.Stat(marker); err == nil {
+			sawMarker = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawMarker {
+		proc.wait(t, 2*time.Second)
+		t.Fatalf("mktemp stub's marker never appeared at %s", marker)
+	}
+
+	if err := syscall.Kill(-proc.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM to process group: %v", err)
+	}
+
+	res := proc.wait(t, 10*time.Second)
+	if res.exitCode != 143 {
+		t.Fatalf("exit = %d, want 143 (128+SIGTERM) after cleanup; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	assertNoLeftoverVendoringTempFiles(t, tmpDirUsed, dir)
 }
 
 // assertNoLeftoverVendoringTempFiles scans tmpDir (TMPDIR, for
