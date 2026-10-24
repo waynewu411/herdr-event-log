@@ -343,6 +343,11 @@ readonly SYNC_SCRIPT_MAX_BYTES=1048576   # 1 MiB size cap on a downloaded script
 # death-by-signal to exit 143. Wait mode never calls either command, so it
 # installs no trap and keeps its pre-vendoring signal behavior byte-for-byte.
 _CLEANUP_PATHS=()
+# Set by cmd_sync to the vendored script's own directory (where tmp_script/
+# sidecar_tmp are created) before either mktemp call below, so _cleanup_all's
+# glob sweep (see its comment) knows where to look. Left empty for
+# cmd_check_source, whose own temp files live under TMPDIR only.
+_CLEANUP_DIR=""
 _register_cleanup() { _CLEANUP_PATHS+=("$1"); }
 _cleanup_all() {
   local p
@@ -351,6 +356,34 @@ _cleanup_all() {
       [ -n "$p" ] && rm -rf "$p"
     done
   fi
+  # Belt-and-suspenders for the mktemp-to-_register_cleanup window: if a
+  # signal lands in that narrow gap (mktemp already created the path, but the
+  # registration call hasn't run yet), the exact-path loop above never learns
+  # about it and the path leaks. Every mktemp template below embeds this
+  # script's own $$ in its name, so a glob scoped to $$ only ever matches a
+  # path THIS invocation could have created — never another, concurrent
+  # run's temp file — making it safe to sweep here unconditionally,
+  # regardless of whether registration ever ran.
+  local tmpdir="${TMPDIR:-/tmp}" g
+  for g in "$tmpdir"/herdr-ewait.verify-ancestry."$$".* \
+           "$tmpdir"/herdr-ewait.check-source."$$".* \
+           "$tmpdir"/herdr-ewait.check-source-latest."$$".*; do
+    [ -e "$g" ] && rm -rf "$g"
+  done
+  if [ -n "$_CLEANUP_DIR" ]; then
+    for g in "$_CLEANUP_DIR"/.herdr-ewait.sh.tmp."$$".* \
+             "$_CLEANUP_DIR"/."$SIDECAR_NAME".tmp."$$".*; do
+      [ -e "$g" ] && rm -rf "$g"
+    done
+  fi
+  # Explicit, unconditional: this runs as an EXIT trap, and bash uses a
+  # trap handler's own LAST command's exit status as the script's final
+  # exit code unless the handler ends by explicitly setting it — without
+  # this, a glob above that simply didn't match anything (its `[ -e "$g" ]`
+  # false, nothing to && into `rm -rf`) would silently overwrite an intended
+  # `exit 0`/`exit 7`/etc. with 1, no matter how successfully the actual
+  # command ran.
+  return 0
 }
 _install_vendoring_traps() {
   trap '_cleanup_all' EXIT
@@ -688,8 +721,28 @@ default_branch_of() {
       return 0
       ;;
   esac
-  ref="$(git_safe -C "$dir" ls-remote --symref origin HEAD 2>/dev/null | awk '$1 == "ref:" {print $2}')"
+  # `ls-remote --symref origin HEAD` doesn't exactly-match "HEAD": a server can
+  # (and, via protocol v2's ref-prefix filtering, sometimes does) also report any
+  # OTHER advertised symref whose name happens to end in "/HEAD" — e.g. a tag or
+  # branch literally named "HEADtag"/"HEADx" with its own "/HEAD" component — as
+  # extra "ref: ..." lines in the same output. `$3 == "HEAD"` keeps only the
+  # record whose ref NAME (not target) is the exact "HEAD" we asked for, and
+  # `exit` after the first match guarantees a single line even if that still
+  # somehow failed. Without this, a decoy symref produced a second "ref: ..."
+  # line, $ref became "refs/heads/main\nrefs/heads/main" (or two DIFFERENT
+  # targets), the "refs/heads/?*" glob below still matched the whole multi-line
+  # string (bash globs don't treat embedded newlines specially), and stripping
+  # the prefix once left a garbled, never-equal-to-anything "default_branch"
+  # value — silently defeating the current-branch comparison and letting
+  # --sync proceed on the real default branch undetected.
+  ref="$(git_safe -C "$dir" ls-remote --symref origin HEAD 2>/dev/null | awk '$1 == "ref:" && $3 == "HEAD" {print $2; exit}')"
   case "$ref" in
+    *$'\n'*)
+      # Defense in depth: even after the fix above, never trust a multi-line
+      # value — treat it as undeterminable and fail closed rather than let a
+      # glob match swallow an embedded newline.
+      return 1
+      ;;
     refs/heads/?*)
       printf '%s' "${ref#refs/heads/}"
       return 0
@@ -717,7 +770,7 @@ verify_sha_on_upstream() {
   command -v git >/dev/null 2>&1 || return 1
   base="$(resolve_remote_base)" || return 1
   url="$base/$repo"
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ewait.verify-ancestry.XXXXXX" 2>/dev/null)" || return 1
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ewait.verify-ancestry.$$.XXXXXX" 2>/dev/null)" || return 1
   _register_cleanup "$scratch"
   # Both -C "$scratch" AND --git-dir="$scratch": --git-dir alone leaves the
   # process's cwd as whatever the caller's was, and git's own setup still
@@ -830,7 +883,7 @@ cmd_check_source() {
   fi
 
   local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/herdr-ewait.check-source.XXXXXX" 2>/dev/null)" || {
+  tmp="$(mktemp "${TMPDIR:-/tmp}/herdr-ewait.check-source.$$.XXXXXX" 2>/dev/null)" || {
     echo "herdr-ewait: --check-source: failed to create a temp file" >&2
     exit "$EXIT_CHECK_SOURCE_FAIL"
   }
@@ -870,7 +923,7 @@ cmd_check_source() {
     # changed — an unrelated commit could have moved it. Fetch the file's content at
     # the new head and compare hashes before claiming upstream-newer.
     local tmp2 head_hash
-    tmp2="$(mktemp "${TMPDIR:-/tmp}/herdr-ewait.check-source-latest.XXXXXX" 2>/dev/null)" || {
+    tmp2="$(mktemp "${TMPDIR:-/tmp}/herdr-ewait.check-source-latest.$$.XXXXXX" 2>/dev/null)" || {
       echo "herdr-ewait: --check-source --latest: failed to create a temp file" >&2
       exit "$EXIT_CHECK_SOURCE_FAIL"
     }
@@ -963,6 +1016,10 @@ cmd_sync() {
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
   fi
   dir="$(dirname -- "$self")"
+  # For _cleanup_all's $$-scoped glob sweep (tmp_script/sidecar_tmp both live
+  # here, below) — set as soon as $dir is known, well before either mktemp
+  # call, so a signal landing anywhere from here on is already covered.
+  _CLEANUP_DIR="$dir"
   sidecar="$dir/$SIDECAR_NAME"
   state="$(sidecar_state "$sidecar")"
 
@@ -1017,7 +1074,7 @@ cmd_sync() {
       exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
     fi
     if default_branch="$(default_branch_of "$dir")"; then
-      local current_lc default_branch_lc
+      local current_lc default_branch_lc current_ref_path default_ref_path
       # Compare case-insensitively, always: on a case-insensitive filesystem
       # (e.g. macOS's default APFS), `git checkout Main` resolves to the SAME
       # loose ref file as an existing "main" branch, but leaves HEAD
@@ -1034,7 +1091,31 @@ cmd_sync() {
       # default — an intentional, documented consequence of always refusing.
       current_lc="$(printf '%s' "$current" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
       default_branch_lc="$(printf '%s' "$default_branch" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-      if [ "$current_lc" = "$default_branch_lc" ]; then
+      # ASCII-only folding above misses APFS's own Unicode-aware case folding
+      # (e.g. "maſter" — long s — lands on the SAME loose ref file as
+      # "master"; likewise "DÉVELOP" vs "dévelop", or the Kelvin sign "K" vs
+      # "k"), which `tr '[:upper:]' '[:lower:]'` under LC_ALL=C never
+      # normalizes. Detect that case directly instead of trying to replicate
+      # Unicode case folding in shell: compare the two branches' loose ref
+      # FILES for filesystem identity (same device+inode) with `-ef`. Both
+      # --git-path outputs are relative to $dir (git -C genuinely chdirs for
+      # path resolution), so prefix them with $dir when relative. A packed
+      # ref has no loose file, so -ef is false for it either way — harmless,
+      # since the name comparison above still catches ordinary non-Unicode
+      # collisions, and git itself already refuses to check out an
+      # ambiguous ref pair backed by packed-refs.
+      current_ref_path="$(git_safe -C "$dir" rev-parse --git-path "refs/heads/$current" 2>/dev/null || true)"
+      case "$current_ref_path" in
+        /*) ;;
+        ?*) current_ref_path="$dir/$current_ref_path" ;;
+      esac
+      default_ref_path="$(git_safe -C "$dir" rev-parse --git-path "refs/heads/$default_branch" 2>/dev/null || true)"
+      case "$default_ref_path" in
+        /*) ;;
+        ?*) default_ref_path="$dir/$default_ref_path" ;;
+      esac
+      if [ "$current_lc" = "$default_branch_lc" ] \
+        || { [ -n "$current_ref_path" ] && [ -n "$default_ref_path" ] && [ "$current_ref_path" -ef "$default_ref_path" ]; }; then
         echo "herdr-ewait: --sync: refused — $dir is on '$default_branch' (this repo's default branch); sync on a branch or in a worktree and open a PR instead" >&2
         exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
       fi
@@ -1094,7 +1175,7 @@ cmd_sync() {
   fi
 
   local tmp_script
-  tmp_script="$(mktemp "$dir/.herdr-ewait.sh.tmp.XXXXXX" 2>/dev/null)" || {
+  tmp_script="$(mktemp "$dir/.herdr-ewait.sh.tmp.$$.XXXXXX" 2>/dev/null)" || {
     echo "herdr-ewait: --sync: failed to create a temp file in $dir" >&2
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
   }
@@ -1125,7 +1206,7 @@ cmd_sync() {
   [ -n "$perm" ] && chmod "$perm" "$tmp_script" 2>/dev/null
 
   local sidecar_tmp
-  sidecar_tmp="$(mktemp "$dir/.${SIDECAR_NAME}.tmp.XXXXXX" 2>/dev/null)" || {
+  sidecar_tmp="$(mktemp "$dir/.${SIDECAR_NAME}.tmp.$$.XXXXXX" 2>/dev/null)" || {
     echo "herdr-ewait: --sync: refused — failed to create a temp file to rewrite the sidecar; nothing was changed" >&2
     exit "$EXIT_SYNC_BAD_DOWNLOAD"
   }
