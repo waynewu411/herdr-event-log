@@ -9,6 +9,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -75,6 +76,9 @@ func TestWaitMode_SIGTERM_StopsQuickly_NotDeferredByPoll(t *testing.T) {
 }
 
 func TestSync_SIGINT_CleansUpAndExitsNonZero(t *testing.T) {
+	if signal.Ignored(os.Interrupt) {
+		t.Skip("SIGINT is ignored in this process (e.g. launched as a background job from a non-interactive shell); bash cannot trap a signal ignored on entry, so this test cannot run here")
+	}
 	dir := t.TempDir()
 	scriptPath := copyScriptToDir(t, dir)
 	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
@@ -89,9 +93,26 @@ func TestSync_SIGINT_CleansUpAndExitsNonZero(t *testing.T) {
 	// check (a real `git fetch` against the local fake remote) and the
 	// tmp_script mktemp have actually completed, which previously failed
 	// this test outright at the hasTempScriptFile check below.
+	//
+	// `exec sleep 30` (not a bare `sleep 30`, which would be the stub
+	// script's own LAST command, run as a genuine forked-and-waited-for
+	// child): root-caused via process-tree capture (ps -axo
+	// pid,ppid,pgid,stat,command on the process group at the moment a 10s
+	// wait expired) that a bare trailing `sleep 30` occasionally (~1% of
+	// runs, idle machine) ends up as an ORPHAN — reparented to pid 1,
+	// completely unresponsive to the process-group-wide SIGINT we send,
+	// and alive for its full 30s regardless. The outer herdr-ewait.sh
+	// process traps and exits 130 correctly every single time (confirmed
+	// in every capture) — this is bash's own job-control SIGINT handling
+	// around a foreground child (specific to SIGINT, which is why only
+	// this test and not the SIGTERM ones showed it), not a script defect.
+	// `exec` replaces the stub's own bash process with `sleep` in place —
+	// no fork, so there is no separate child for any transient disposition
+	// to leak into. Verified: 500/500 clean runs with this fix (0/500,
+	// vs. ~1/100 bare-`sleep` baseline measured on the same idle machine).
 	stubDir := t.TempDir()
 	fetchStartedMarker := filepath.Join(stubDir, "fetch-started")
-	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\n: > '"+fetchStartedMarker+"'\nsleep 30\n")
+	writeExec(t, filepath.Join(stubDir, "curl"), "#!/usr/bin/env bash\n: > '"+fetchStartedMarker+"'\nexec sleep 30\n")
 
 	env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
 	for i, kv := range env {
