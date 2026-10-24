@@ -719,17 +719,20 @@ verify_sha_on_upstream() {
   url="$base/$repo"
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ewait.verify-ancestry.XXXXXX" 2>/dev/null)" || return 1
   _register_cleanup "$scratch"
-  # --git-dir="$scratch", not `-C "$scratch"`: with the user's
-  # safe.bareRepository=explicit (a real gitconfig setting), `-C` on a bare
-  # repo fails with "cannot use bare repository" because `-C` only changes
-  # directory and lets git DISCOVER the repo there, which that setting
-  # refuses for anything but an EXPLICITLY named git dir — exactly what
-  # --git-dir provides. `git init --bare` itself is unaffected (creating the
-  # directory, not discovering an existing repo in it).
-  if git_safe init -q --bare "$scratch" >/dev/null 2>&1 \
-    && { git_safe --git-dir="$scratch" fetch -q --no-tags --filter=tree:0 -- "$url" HEAD >/dev/null 2>&1 \
-         || git_safe --git-dir="$scratch" fetch -q --no-tags -- "$url" HEAD >/dev/null 2>&1; } \
-    && git_safe --git-dir="$scratch" merge-base --is-ancestor "$sha" FETCH_HEAD 2>/dev/null; then
+  # Both -C "$scratch" AND --git-dir="$scratch": --git-dir alone leaves the
+  # process's cwd as whatever the caller's was, and git's own setup still
+  # calls getcwd() early on — if that cwd has since been deleted (e.g. a
+  # caller that `rm -rf`'d its own working directory), the call fails with
+  # "Unable to read current working directory" even though it never needed
+  # the cwd for anything. -C "$scratch" changes into a directory that always
+  # exists (mktemp -d just created it) before --git-dir does its job of
+  # satisfying the user's safe.bareRepository=explicit (-C's own bare-repo
+  # discovery is what that setting refuses — --git-dir names the git dir
+  # explicitly instead of letting git discover it).
+  if git_safe -C "$scratch" --git-dir="$scratch" init -q --bare "$scratch" >/dev/null 2>&1 \
+    && { git_safe -C "$scratch" --git-dir="$scratch" fetch -q --no-tags --filter=tree:0 -- "$url" HEAD >/dev/null 2>&1 \
+         || git_safe -C "$scratch" --git-dir="$scratch" fetch -q --no-tags -- "$url" HEAD >/dev/null 2>&1; } \
+    && git_safe -C "$scratch" --git-dir="$scratch" merge-base --is-ancestor "$sha" FETCH_HEAD 2>/dev/null; then
     ok=0
   fi
   rm -rf "$scratch"
@@ -1014,7 +1017,24 @@ cmd_sync() {
       exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
     fi
     if default_branch="$(default_branch_of "$dir")"; then
-      if [ "$current" = "$default_branch" ]; then
+      local current_lc default_branch_lc
+      # Compare case-insensitively, always: on a case-insensitive filesystem
+      # (e.g. macOS's default APFS), `git checkout Main` resolves to the SAME
+      # loose ref file as an existing "main" branch, but leaves HEAD
+      # symbolically pointing at the literal string "refs/heads/Main" — an
+      # exact-string comparison against default_branch_of's "main" would
+      # treat that as a different, non-default branch and wrongly let --sync
+      # proceed on what is, on that filesystem, the actual default branch.
+      # Folding case everywhere (not just conditionally, by detecting the
+      # filesystem) is the simplest fix that is safe on every platform: it
+      # can only make this refusal MORE conservative, never less, so a repo
+      # with two genuinely distinct, case-differing branch names on a
+      # case-sensitive filesystem (e.g. "main" and "Main" both existing) is
+      # also refused if the current one case-insensitively matches the
+      # default — an intentional, documented consequence of always refusing.
+      current_lc="$(printf '%s' "$current" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+      default_branch_lc="$(printf '%s' "$default_branch" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+      if [ "$current_lc" = "$default_branch_lc" ]; then
         echo "herdr-ewait: --sync: refused — $dir is on '$default_branch' (this repo's default branch); sync on a branch or in a worktree and open a PR instead" >&2
         exit "$EXIT_SYNC_ON_DEFAULT_BRANCH"
       fi
