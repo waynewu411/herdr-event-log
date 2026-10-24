@@ -2097,6 +2097,45 @@ func TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback_WithAmbiguousRefs
 	}
 }
 
+// TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback_WithDecoySymref
+// covers a server (or just a repo state) that advertises a SECOND symref
+// whose name also ends in "/HEAD" (e.g. a tag or branch literally named
+// "HEADtag"/"HEADx") alongside the real "HEAD" one — `ls-remote --symref
+// origin HEAD` doesn't exactly-match the ref name it was asked for, so both
+// get reported as separate "ref: ..." lines. Before filtering on the ref
+// NAME (not just the literal word "ref:"), the combined multi-line value
+// matched the "refs/heads/?*" glob as a whole (bash globs don't treat
+// embedded newlines specially) and left a garbled "default_branch" that
+// never equaled the actual current branch — silently defeating the refusal
+// and letting --sync proceed on the real default branch.
+func TestSync_Refuse_OnDefaultBranch_ViaLsRemoteSymrefFallback_WithDecoySymref(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	initGitRepoWithDefaultBranch(t, dir) // creates+checks out "main", current HEAD
+	dropLocalOriginHeadRef(t, dir)
+	bareOrigin := setupLocalBareOrigin(t)
+	gitCmd(t, dir, "remote", "add", "origin", bareOrigin)
+	// A decoy symref whose name also ends in "/HEAD", advertised by the same
+	// remote alongside the real HEAD.
+	gitCmd(t, bareOrigin, "symbolic-ref", "refs/tags/HEADtag/HEAD", "refs/heads/main")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (a decoy symref ending in /HEAD must not defeat the ls-remote --symref fallback); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
 // TestSync_Success_OnFeatureBranch_ViaLsRemoteSymrefFallback is the control:
 // the same ls-remote --symref fallback setup, but on a feature branch, which
 // must proceed PAST the default-branch refusal (it still fails later, at the
@@ -2153,6 +2192,44 @@ func TestSync_Refuse_OnDefaultBranch_CaseInsensitiveCheckout(t *testing.T) {
 		t.Fatalf("exit = %d, want %d (checking out 'Main' on a case-insensitive filesystem must still refuse as the default branch); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
 	}
 	if !strings.Contains(res.stderr, "is on 'main'") {
+		t.Errorf("stderr should name the default branch; got %q", res.stderr)
+	}
+	after, _ := os.ReadFile(scriptPath)
+	if string(before) != string(after) {
+		t.Errorf("script file must not be touched on refusal")
+	}
+}
+
+// TestSync_Refuse_OnDefaultBranch_UnicodeCaseFold covers APFS's own
+// Unicode-aware case folding, which `tr '[:upper:]' '[:lower:]'` under
+// LC_ALL=C never replicates: "maſter" (long s, U+017F) resolves to the SAME
+// loose ref file as "master" on such a filesystem, but is untouched by an
+// ASCII-only fold, so the name comparison alone doesn't catch it — only the
+// filesystem-identity (-ef) check does.
+func TestSync_Refuse_OnDefaultBranch_UnicodeCaseFold(t *testing.T) {
+	if filesystemIsCaseSensitive(t) {
+		t.Skip("filesystem is case-sensitive; APFS's Unicode-aware case folding (the long s in 'maſter') doesn't collide with 'master' there")
+	}
+
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	before, _ := os.ReadFile(scriptPath)
+	writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, strings.Repeat("a", 40))
+
+	gitCmd(t, dir, "init", "-q", "-b", "master")
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init", "--allow-empty")
+	headSHA := strings.TrimSpace(gitCmd(t, dir, "rev-parse", "HEAD"))
+	gitCmd(t, dir, "update-ref", "refs/remotes/origin/master", headSHA)
+	gitCmd(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+	gitCmd(t, dir, "checkout", "-q", "maſter")
+
+	res := runEwaitScript(t, scriptPath, []string{"--sync", strings.Repeat("b", 40)}, deadHookEnv(t), 10*time.Second)
+
+	if res.exitCode != exitSyncOnDefaultBranch {
+		t.Fatalf("exit = %d, want %d (Unicode case folding on a case-insensitive filesystem must still refuse as the default branch); stdout=%q stderr=%q", res.exitCode, exitSyncOnDefaultBranch, res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "is on 'master'") {
 		t.Errorf("stderr should name the default branch; got %q", res.stderr)
 	}
 	after, _ := os.ReadFile(scriptPath)

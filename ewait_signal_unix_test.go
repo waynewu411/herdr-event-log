@@ -265,9 +265,21 @@ func TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir(t *testing.T) {
 	// Passthrough to the real git for everything except a "fetch" invocation
 	// (verify_sha_on_upstream's long-running ancestry step), which blocks long
 	// enough for the test to deliver SIGTERM while the scratch dir still exists.
+	// The marker file, written immediately before `sleep 30`, lets the test
+	// wait for the sleep to actually be running (not just about to be started)
+	// before sending SIGTERM: sending it too early — e.g. while the "init"
+	// step that precedes "fetch" is still the foreground command, or in the
+	// narrow window between the stub process forking and `sleep` itself
+	// starting — can leave bash deferring the TERM trap until that still-
+	// running foreground command finishes, which for `sleep 30` is far
+	// longer than this test's 10s wait.
+	fetchStartedMarker := filepath.Join(stubDir, "fetch-started")
 	script := "#!/usr/bin/env bash\n" +
 		"for a in \"$@\"; do\n" +
-		"  [ \"$a\" = \"fetch\" ] && sleep 30\n" +
+		"  if [ \"$a\" = \"fetch\" ]; then\n" +
+		"    : > '" + fetchStartedMarker + "'\n" +
+		"    sleep 30\n" +
+		"  fi\n" +
 		"done\n" +
 		"exec '" + realGit + "' \"$@\"\n"
 	writeExec(t, filepath.Join(stubDir, "git"), script)
@@ -299,6 +311,20 @@ func TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir(t *testing.T) {
 		t.Fatalf("ancestry scratch dir never appeared under %s", tmpDir)
 	}
 
+	markerDeadline := time.Now().Add(5 * time.Second)
+	var sawFetchStarted bool
+	for time.Now().Before(markerDeadline) {
+		if _, err := os.Stat(fetchStartedMarker); err == nil {
+			sawFetchStarted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawFetchStarted {
+		proc.wait(t, 2*time.Second)
+		t.Fatalf("fetch-started marker never appeared at %s", fetchStartedMarker)
+	}
+
 	if err := syscall.Kill(-proc.cmd.Process.Pid, syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM to process group: %v", err)
 	}
@@ -309,6 +335,110 @@ func TestSync_SIGTERM_DuringAncestryCheck_LeavesNoScratchDir(t *testing.T) {
 	}
 	if hasAncestryScratchDir(t, tmpDir) {
 		t.Errorf("leftover herdr-ewait.verify-ancestry.* scratch dir after SIGTERM cleanup")
+	}
+}
+
+// TestSync_SIGTERM_Stress_NoLeftoverTempFiles sends SIGTERM at a spread of
+// small delays from process start — some land before the ancestry check's
+// scratch dir even exists, some while "init" is the foreground command,
+// some mid-sleep during the stubbed "fetch" — covering the mktemp-to-
+// _register_cleanup gap this round's fix targets (every mktemp template now
+// embeds $$, and _cleanup_all's glob sweep catches anything the exact-path
+// registry missed) without needing to land the signal in that specific,
+// microseconds-wide window exactly: a leftover temp file/dir under either
+// TMPDIR or the sync directory after ANY trial is a failure, regardless of
+// which point in the flow the signal happened to interrupt. Bounded
+// runtime: every trial's fake git stub sleeps during "fetch" far longer
+// than any delay tried here, so --sync never reaches the install phase
+// (and so never mutates the real script/sidecar) in any trial.
+func TestSync_SIGTERM_Stress_NoLeftoverTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := copyScriptToDir(t, dir)
+	remoteBase, _, headSHA := setupFakeRemote(t, fakeRepo)
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	delays := []time.Duration{
+		0,
+		5 * time.Millisecond,
+		15 * time.Millisecond,
+		30 * time.Millisecond,
+		50 * time.Millisecond,
+		75 * time.Millisecond,
+		100 * time.Millisecond,
+		150 * time.Millisecond,
+		250 * time.Millisecond,
+		400 * time.Millisecond,
+	}
+
+	for _, delay := range delays {
+		t.Run(delay.String(), func(t *testing.T) {
+			writeSidecar(t, dir, fakeRepo, fakeScriptRelPath, headSHA)
+
+			stubDir := t.TempDir()
+			script := "#!/usr/bin/env bash\n" +
+				"for a in \"$@\"; do\n" +
+				"  [ \"$a\" = \"fetch\" ] && sleep 5\n" +
+				"done\n" +
+				"exec '" + realGit + "' \"$@\"\n"
+			writeExec(t, filepath.Join(stubDir, "git"), script)
+
+			tmpDir := t.TempDir()
+			env := testHookEnv(t, "HERDR_EWAIT_REMOTE_BASE_URL="+remoteBase)
+			for j, kv := range env {
+				switch {
+				case strings.HasPrefix(kv, "PATH="):
+					env[j] = "PATH=" + stubDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+				case strings.HasPrefix(kv, "TMPDIR="):
+					env[j] = "TMPDIR=" + tmpDir
+				}
+			}
+
+			proc := startEwaitAt(t, scriptPath, []string{"--sync", headSHA}, env)
+			time.Sleep(delay)
+			if err := syscall.Kill(-proc.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+				t.Fatalf("send SIGTERM to process group: %v", err)
+			}
+			proc.wait(t, 10*time.Second)
+
+			assertNoLeftoverVendoringTempFiles(t, tmpDir, dir)
+		})
+	}
+}
+
+// assertNoLeftoverVendoringTempFiles scans tmpDir (TMPDIR, for
+// verify_sha_on_upstream's scratch dir and --check-source's own temp files)
+// and workDir (the synced-into directory, for tmp_script/sidecar_tmp) for
+// any file/dir matching one of the script's known vendoring-temp-file
+// prefixes.
+func assertNoLeftoverVendoringTempFiles(t *testing.T, tmpDir, workDir string) {
+	t.Helper()
+	tmpPrefixes := []string{
+		"herdr-ewait.verify-ancestry.",
+		"herdr-ewait.check-source.",
+		"herdr-ewait.check-source-latest.",
+	}
+	if entries, err := os.ReadDir(tmpDir); err == nil {
+		for _, e := range entries {
+			for _, pfx := range tmpPrefixes {
+				if strings.HasPrefix(e.Name(), pfx) {
+					t.Errorf("leftover %s under TMPDIR (%s) after SIGTERM", e.Name(), tmpDir)
+				}
+			}
+		}
+	}
+	workPrefixes := []string{".herdr-ewait.sh.tmp.", ".herdr-ewait.source.tmp."}
+	if entries, err := os.ReadDir(workDir); err == nil {
+		for _, e := range entries {
+			for _, pfx := range workPrefixes {
+				if strings.HasPrefix(e.Name(), pfx) {
+					t.Errorf("leftover %s under %s after SIGTERM", e.Name(), workDir)
+				}
+			}
+		}
 	}
 }
 
